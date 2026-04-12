@@ -1,14 +1,18 @@
 # main.py
-
-from orchestrator.graph import run_pipeline
+from dotenv import load_dotenv
+load_dotenv()
+from orchestrator.langgraph_pipeline import build_graph
 
 initial_state = {
     "dataset_path": "data.csv",
     "target_column": "target",
     "problem_type": "classification",
-    "objective": "Maximize accuracy"
+    "objective": "Maximize prediction accuracy"
 }
 
-final_state = run_pipeline(initial_state)
+graph = build_graph()
+graph.get_graph(xray=True).draw_png("graph.png")
+final_state = graph.invoke(initial_state)
 
+print("✅ Pipeline Completed")
 print(final_state["advanced_result"])

@@ -18,5 +18,5 @@ class AgentState(TypedDict):
     baseline_result: Dict
     advanced_result: Dict
 
-    final_decision: Dict
+    decision_log: Dict
     notebook_json: Dict
