@@ -211,3 +211,5 @@ outputs/
 *.ipynb
 .env
 .claude/
+mlruns
+*.csv

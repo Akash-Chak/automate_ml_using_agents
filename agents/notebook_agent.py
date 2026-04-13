@@ -193,6 +193,37 @@ def _optuna_suggest_block(model_id: str, problem_type: str) -> str:
 # Section generators (each returns a list of cells)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _section_mlflow_info(state: dict) -> list:
+    """Insert an MLflow experiment reference cell if the pipeline logged to MLflow."""
+    hpo_run  = state.get("mlflow_hpo_run_id", "")
+    base_run = state.get("mlflow_baseline_run_id", "")
+    exp_name = state.get("mlflow_experiment_name", "")
+    mode     = state.get("tuning_mode", "")
+    uri      = state.get("mlflow_tracking_uri", "./mlruns")
+
+    if not (hpo_run or base_run):
+        return []
+
+    lines = ["## MLflow Experiment Tracking", ""]
+    if exp_name:
+        lines.append(f"- **Experiment:** `{exp_name}`")
+    if base_run:
+        lines.append(f"- **Baseline Run ID:** `{base_run}`")
+    if hpo_run:
+        lines.append(f"- **HPO Run ID:** `{hpo_run}`")
+    if mode:
+        lines.append(f"- **Tuning Mode:** `{mode}`")
+    lines += [
+        "",
+        "To view results in the MLflow UI:",
+        f"```bash",
+        f"mlflow ui --backend-store-uri {uri}",
+        f"```",
+        "Then open http://localhost:5000 in your browser.",
+    ]
+    return [_md("\n".join(lines))]
+
+
 def _section_title(state: dict) -> list:
     target = state.get("target_column", "target")
     problem_type = state.get("problem_type", "classification").title()
@@ -1186,6 +1217,7 @@ def notebook_agent(state: dict) -> dict:
 
     cells: list = []
     cells += _section_title(state)
+    cells += _section_mlflow_info(state)
     cells += _section_setup()
     cells += _section_data_loading(state)
     cells += _section_eda(state)

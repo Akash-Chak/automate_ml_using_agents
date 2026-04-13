@@ -41,6 +41,15 @@ from sklearn.svm import LinearSVC, LinearSVR, SVC, SVR
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 
 from utils.data_utils import ensure_processed_data
+from utils.mlflow_utils import (
+    MLFLOW_AVAILABLE,
+    end_hpo_run,
+    fetch_best_hpo_params,
+    get_experiment_url,
+    log_hpo_start,
+    log_tuning_trial,
+    setup_mlflow_experiment,
+)
 
 try:
     from xgboost import XGBClassifier, XGBRegressor
@@ -580,12 +589,192 @@ def _trial_record(base_record, scores, params):
     }
 
 
+def _run_cached_hpo(
+    state,
+    cached: dict,
+    registry: dict,
+    X_train,
+    X_test,
+    y_train,
+    y_test,
+    primary_metric: str,
+    problem_type: str,
+    model_ids: list,
+    decision: dict,
+    imbalance_ratio,
+):
+    """
+    Reconstruct advanced_result from MLflow-cached best params without running Optuna.
+    Emits _emit_progress events so the Streamlit status bar still animates.
+    """
+    candidate_results = []
+    best_result = None
+    model_count = len([mid for mid in model_ids if mid in cached and mid in registry])
+
+    _emit_progress(state, {
+        "phase": "start",
+        "problem_type": problem_type,
+        "metric": primary_metric,
+        "models": model_ids,
+        "cv_folds": 0,
+        "optuna_trials_per_model": 1,
+    })
+
+    for model_index, model_id in enumerate(model_ids, start=1):
+        if model_id not in cached or model_id not in registry:
+            continue
+        cached_entry = cached[model_id]
+        spec         = registry[model_id]
+        params       = cached_entry.get("params", {})
+        strategy     = cached_entry.get("strategy", "default")
+        class_weight = "balanced" if strategy == "balanced" else None
+
+        _emit_progress(state, {
+            "phase":       "start_model",
+            "model_id":    model_id,
+            "label":       spec["label"],
+            "model_index": model_index,
+            "model_count": model_count,
+            "strategies":  [strategy],
+        })
+
+        try:
+            estimator = spec["builder"](class_weight) if problem_type == "classification" else spec["builder"]()
+            estimator.set_params(**params)
+            if problem_type == "classification":
+                holdout_scores = _score_classification(estimator, X_train, X_test, y_train, y_test)
+            else:
+                holdout_scores = _score_regression(estimator, X_train, X_test, y_train, y_test)
+
+            primary_score = holdout_scores[primary_metric]
+            scores = {
+                "cv_score":    cached_entry.get("cv_score", primary_score),
+                "primary_score": primary_score,
+                **holdout_scores,
+            }
+
+            _emit_progress(state, {
+                "phase":                 "trial_complete",
+                "model_id":              model_id,
+                "label":                 spec["label"],
+                "strategy":              strategy,
+                "trial_index":           1,
+                "trial_count":           1,
+                "optuna_trial_number":   0,
+                "params":                params,
+                "metric":                primary_metric,
+                "cv_score":              round(scores["cv_score"], 4),
+                "holdout_primary_score": round(primary_score, 4),
+            })
+
+            row = {
+                "model_id":   model_id,
+                "model":      spec["label"],
+                "strategy":   strategy,
+                "cv_score":   round(scores["cv_score"], 4),
+                "metric":     primary_metric,
+                "score":      round(primary_score, 4),
+                "best_params": params,
+                "note":       spec["note"],
+            }
+            for k in ("accuracy", "f1_weighted", "r2", "mae", "rmse"):
+                if k in holdout_scores:
+                    row[k] = _safe_float(round(holdout_scores[k], 4))
+            candidate_results.append(row)
+
+            if best_result is None or scores["cv_score"] > best_result["cv_score"]:
+                best_result = {
+                    "model_id":    model_id,
+                    "model_label": spec["label"],
+                    "strategy":    strategy,
+                    "params":      params,
+                    "cv_score":    scores["cv_score"],
+                    "note":        spec["note"],
+                    "metric":      primary_metric,
+                    **{k: v for k, v in holdout_scores.items()},
+                }
+                _emit_progress(state, {
+                    "phase":                 "best_update",
+                    "model_id":              model_id,
+                    "label":                 spec["label"],
+                    "strategy":              strategy,
+                    "params":                params,
+                    "metric":                primary_metric,
+                    "cv_score":              round(scores["cv_score"], 4),
+                    "holdout_primary_score": round(primary_score, 4),
+                })
+        except Exception as exc:
+            _emit_progress(state, {
+                "phase":    "trial_error",
+                "model_id": model_id,
+                "label":    spec["label"],
+                "strategy": strategy,
+                "params":   params,
+                "error":    str(exc),
+            })
+
+    if best_result is None:
+        return {**state, "error": "Cached HPO: no model could be evaluated on holdout data."}
+
+    _emit_progress(state, {
+        "phase":    "completed",
+        "model_id": best_result["model_id"],
+        "label":    best_result["model_label"],
+        "strategy": best_result["strategy"],
+        "params":   best_result["params"],
+        "metric":   primary_metric,
+        "score":    round(best_result[primary_metric], 4),
+    })
+
+    advanced_result = {
+        "model":                       best_result["model_label"],
+        "model_id":                    best_result["model_id"],
+        "score":                       _safe_float(best_result[primary_metric]),
+        "metric":                      primary_metric,
+        "score_direction":             "higher_is_better",
+        "selection_reason":            decision.get("reason", "Loaded from prior MLflow HPO run."),
+        "model_reason":                best_result["note"],
+        "best_hyperparameters":        best_result["params"],
+        "tuning_cv_score":             _safe_float(best_result["cv_score"]),
+        "tuning_strategy_selected":    best_result["strategy"],
+        "candidate_models_considered": model_ids,
+        "candidate_results":           candidate_results,
+        "tuning_history":              [],
+        "tuning_summary": {
+            "cv_folds":                0,
+            "optimizer":               "mlflow_cached",
+            "optuna_trials_per_model": 0,
+            "models_requested_by_decision_agent": model_ids,
+            "models_evaluated":        [r["model_id"] for r in candidate_results],
+        },
+    }
+
+    if imbalance_ratio is not None:
+        advanced_result["class_balance_ratio"] = round(imbalance_ratio, 4)
+
+    if problem_type == "classification":
+        advanced_result["accuracy"]   = _safe_float(best_result.get("accuracy"))
+        advanced_result["f1_weighted"] = _safe_float(best_result.get("f1_weighted"))
+    else:
+        advanced_result["r2"]   = _safe_float(best_result.get("r2"))
+        advanced_result["mae"]  = _safe_float(best_result.get("mae"))
+        advanced_result["rmse"] = _safe_float(best_result.get("rmse"))
+
+    state["advanced_result"] = advanced_result
+    return state
+
+
 def hyperparameter_tuning_agent(state):
     target = state["target_column"]
     problem_type = state["problem_type"]
     decision = state.get("decision_log", {}).get("model_selection", {})
     tuning_strategy = decision.get("tuning_strategy", {})
     requested_models = decision.get("candidate_models", [])
+
+    # ── MLflow + tuning mode config ─────────────────────────────────────────
+    tuning_mode  = state.get("tuning_mode", "smoke_test")
+    exp_name     = state.get("mlflow_experiment_name", "")
+    tracking_uri = state.get("mlflow_tracking_uri", "./mlruns")
 
     df = ensure_processed_data(state)
     X = df.drop(columns=[target])
@@ -622,6 +811,48 @@ def hyperparameter_tuning_agent(state):
     model_ids = [model_id for model_id in requested_models if model_id in registry]
     if not model_ids:
         model_ids = list(registry.keys())
+
+    # ── Reuse path: fetch cached params from prior MLflow HPO run ────────────
+    if tuning_mode == "reuse_mlflow" and exp_name:
+        cached = fetch_best_hpo_params(exp_name, tracking_uri)
+        if cached:
+            result = _run_cached_hpo(
+                state, cached, registry,
+                X_train, X_test, y_train, y_test,
+                primary_metric, problem_type, model_ids,
+                decision, imbalance_ratio,
+            )
+            # Tag with the source run_id from cached entry (first model as reference)
+            first_cached = next(iter(cached.values()), {})
+            if first_cached.get("run_id"):
+                result["mlflow_hpo_run_id"]     = first_cached["run_id"]
+                result["mlflow_experiment_url"] = get_experiment_url(tracking_uri, exp_name)
+            return result
+        else:
+            # No prior run found — fall back to smoke test
+            tuning_mode = "smoke_test"
+            _emit_progress(state, {
+                "phase": "info",
+                "msg":   "No prior MLflow HPO run found for this experiment; falling back to smoke test.",
+            })
+
+    # ── Smoke test: 1 random trial per model (verify structure, create MLflow run) ─
+    if tuning_mode == "smoke_test":
+        optuna_trials_per_model = 1
+        sampler_factory = lambda: optuna.samplers.RandomSampler(seed=42)
+    else:
+        # full_search: use decision agent's trial count and TPE sampler
+        sampler_factory = lambda: optuna.samplers.TPESampler(seed=42)
+
+    # ── Open MLflow parent HPO run ───────────────────────────────────────────
+    mlflow_hpo_run_id = None
+    if exp_name:
+        if MLFLOW_AVAILABLE:
+            setup_mlflow_experiment(tracking_uri, exp_name)
+        mlflow_hpo_run_id = log_hpo_start(
+            exp_name, tracking_uri, state,
+            tuning_mode, cv_folds, optuna_trials_per_model, model_ids,
+        )
 
     tuning_history = []
     candidate_results = []
@@ -665,7 +896,7 @@ def hyperparameter_tuning_agent(state):
             for strategy_name, class_weight in strategies:
                 study = optuna.create_study(
                     direction="maximize",
-                    sampler=optuna.samplers.TPESampler(seed=42),
+                    sampler=sampler_factory(),
                     study_name=f"{model_id}_{strategy_name}",
                 )
 
@@ -759,6 +990,13 @@ def hyperparameter_tuning_agent(state):
                         },
                     )
 
+                    # Log this trial to MLflow
+                    if mlflow_hpo_run_id:
+                        log_tuning_trial(
+                            mlflow_hpo_run_id, model_id, trial_index,
+                            params, scores, strategy_name, primary_metric,
+                        )
+
                     if model_best is None or scores["cv_score"] > model_best["cv_score"]:
                         model_best = {
                             "model_id": model_id,
@@ -815,6 +1053,8 @@ def hyperparameter_tuning_agent(state):
                 )
 
     if best_result is None or best_estimator is None:
+        if mlflow_hpo_run_id:
+            end_hpo_run(mlflow_hpo_run_id, None, None)
         return {**state, "error": "Hyperparameter tuning failed for all candidate models."}
 
     if problem_type == "classification":
@@ -871,6 +1111,16 @@ def hyperparameter_tuning_agent(state):
         advanced_result["r2"] = _safe_float(final_scores["r2"])
         advanced_result["mae"] = _safe_float(final_scores["mae"])
         advanced_result["rmse"] = _safe_float(final_scores["rmse"])
+
+    # ── Finalise MLflow HPO parent run ───────────────────────────────────────
+    if mlflow_hpo_run_id:
+        end_hpo_run(
+            mlflow_hpo_run_id,
+            best_result.get("cv_score"),
+            best_result.get("model_id"),
+        )
+        state["mlflow_hpo_run_id"]     = mlflow_hpo_run_id
+        state["mlflow_experiment_url"] = get_experiment_url(tracking_uri, exp_name)
 
     state["advanced_result"] = advanced_result
     return state

@@ -13,54 +13,6 @@ from pathlib import Path
 from orchestrator.langgraph_pipeline import build_graph
 from config import validate_api_key
 
-SNAPSHOT_FILE = ".pipeline_snapshot.json"
-_SKIP_STATE_KEYS = {"raw_data", "processed_data", "_progress_callback"}
-
-
-def _save_snapshot():
-    """Write pipeline progress to disk so a page reload can restore it."""
-    safe_state = {}
-    for k, v in st.session_state.latest_state.items():
-        if k in _SKIP_STATE_KEYS:
-            continue
-        try:
-            json.dumps(v, default=str)
-            safe_state[k] = v
-        except Exception:
-            pass
-    snap = {
-        "log_lines":   st.session_state.log_lines,
-        "step_status": st.session_state.step_status,
-        "step_times":  st.session_state.step_times,
-        "completed":   st.session_state.completed,
-        "tuning_live": st.session_state.tuning_live,
-        "latest_state": safe_state,
-        "saved_at":    time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    try:
-        with open(SNAPSHOT_FILE, "w") as f:
-            json.dump(snap, f, default=str)
-    except Exception:
-        pass
-
-
-def _restore_snapshot() -> str:
-    """Load snapshot. Returns saved_at string, or '' if nothing to restore."""
-    if not os.path.exists(SNAPSHOT_FILE):
-        return ""
-    try:
-        with open(SNAPSHOT_FILE) as f:
-            snap = json.load(f)
-        st.session_state.log_lines    = snap.get("log_lines", [])
-        st.session_state.step_status  = snap.get("step_status", {})
-        st.session_state.step_times   = snap.get("step_times", {})
-        st.session_state.completed    = snap.get("completed", False)
-        st.session_state.tuning_live  = snap.get("tuning_live", {})
-        st.session_state.latest_state = snap.get("latest_state", {})
-        st.session_state.running      = False   # can't resume after reload
-        return snap.get("saved_at", "restored")
-    except Exception:
-        return ""
 
 # ─────────────────────────────────────────────
 # Page Config
@@ -330,6 +282,8 @@ st.markdown("""
 
     /* Hide default streamlit elements */
     #MainMenu, footer, header { visibility: hidden; }
+    /* Always show the sidebar expand button (hidden by the rule above in Edge) */
+    [data-testid="collapsedControl"] { visibility: visible !important; }
     .block-container { padding-top: 1rem; padding-bottom: 2rem; }
 </style>
 """, unsafe_allow_html=True)
@@ -351,6 +305,11 @@ defaults = {
     "loaded_dtypes": {},
     "api_key_ok": None,       # None = not checked yet
     "api_key_msg": "",
+    # MLflow + tuning
+    "mlflow_experiment_name": "",
+    "mlflow_tracking_uri":    "./mlruns",
+    "tuning_mode":            "smoke_test",
+    "status_bar_data":        {},
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -386,6 +345,7 @@ STEP_LABELS = {
 # Sidebar
 # ─────────────────────────────────────────────
 with st.sidebar:
+    st.empty()  # forces early render
     st.markdown("""
     <div style='padding:0.5rem 0 1.2rem 0;'>
         <div style='font-family:Syne,sans-serif;font-weight:800;font-size:1.1rem;
@@ -397,8 +357,19 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
     # ── Step 1: Data source ──────────────────────
-    uploaded_file = st.file_uploader("Upload Dataset (CSV)", type=["csv"])
-    manual_path   = st.text_input("— or enter file path", "train.csv")
+    is_running = st.session_state.running
+
+    uploaded_file = st.file_uploader(
+        "Upload Dataset (CSV)",
+        type=["csv"],
+        disabled=is_running
+    )
+
+    manual_path = st.text_input(
+        "— or enter file path",
+        "train.csv",
+        disabled=is_running
+    )
 
     # Load columns whenever the source changes
     _src_key = (uploaded_file.name if uploaded_file else "", manual_path)
@@ -429,7 +400,12 @@ with st.sidebar:
         # Keep previous selection if still valid
         prev_target = st.session_state.get("_sel_target", cols[-1])
         default_idx = cols.index(prev_target) if prev_target in cols else len(cols) - 1
-        target_column = st.selectbox("Target Column", cols, index=default_idx)
+        target_column = st.selectbox(
+                                        "Target Column",
+                                        cols,
+                                        index=default_idx,
+                                        disabled=is_running
+                                    )
         st.session_state["_sel_target"] = target_column
     else:
         target_column = st.text_input("Target Column", "target")
@@ -482,6 +458,75 @@ with st.sidebar:
     # dataset_path used downstream
     dataset_path = st.session_state.loaded_path or manual_path
 
+    # ── MLflow + Tuning Config ───────────────────
+    st.markdown("<hr style='border-color:#1e2535;margin:1rem 0;'>", unsafe_allow_html=True)
+    st.markdown(
+        "<div style='font-family:JetBrains Mono,monospace;font-size:0.7rem;"
+        "color:#64748b;text-transform:uppercase;letter-spacing:1px;"
+        "margin-bottom:0.5rem;'>MLflow & Tuning</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Auto-generate default experiment name
+    _default_exp = st.session_state.get("mlflow_experiment_name", "")
+    if not _default_exp and st.session_state.loaded_path and cols:
+        _stem = Path(st.session_state.loaded_path).stem.replace("uploaded_", "")
+        _default_exp = f"{_stem}_{target_column}_{problem_type}"
+
+    _exp_input = st.text_input(
+        "Experiment Name",
+        value=_default_exp,
+        disabled=is_running,
+        help="MLflow experiment name. Leave blank to skip MLflow logging.",
+    )
+    st.session_state["mlflow_experiment_name"] = _exp_input
+
+    _uri_input = st.text_input(
+        "Tracking URI",
+        value=st.session_state.get("mlflow_tracking_uri", "./mlruns"),
+        disabled=is_running,
+        help="Local path (./mlruns) or remote MLflow server URI.",
+    )
+    st.session_state["mlflow_tracking_uri"] = _uri_input
+
+    _TUNING_LABELS = {
+        "smoke_test":   "Smoke Test (fast — 1 random trial)",
+        "reuse_mlflow": "Reuse MLflow Results",
+        "full_search":  "Full HPO Search",
+    }
+    _tuning_opts = list(_TUNING_LABELS.keys())
+    _tuning_default = st.session_state.get("tuning_mode", "smoke_test")
+    _tuning_idx = _tuning_opts.index(_tuning_default) if _tuning_default in _tuning_opts else 0
+    _tuning_input = st.selectbox(
+        "Tuning Mode",
+        options=_tuning_opts,
+        format_func=lambda k: _TUNING_LABELS[k],
+        index=_tuning_idx,
+        disabled=is_running,
+    )
+    st.session_state["tuning_mode"] = _tuning_input
+
+    # Show clickable MLflow experiment link whenever a URL is available
+    _sidebar_exp_url = (
+        st.session_state.latest_state.get("mlflow_experiment_url")
+        or st.session_state.get("_last_mlflow_url", "")
+    )
+    if not _sidebar_exp_url and _exp_input:
+        # Try to construct even before a run, so the link is always reachable
+        from utils.mlflow_utils import get_experiment_url as _geu
+        _sidebar_exp_url = _geu(_uri_input, _exp_input) or ""
+    if _sidebar_exp_url:
+        st.session_state["_last_mlflow_url"] = _sidebar_exp_url
+        st.markdown(
+            f"<a href='{_sidebar_exp_url}' target='_blank' style='"
+            f"display:block;background:#0a1f2d;border:1px solid #1e3a5f;"
+            f"border-radius:6px;padding:0.4rem 0.7rem;margin-top:0.4rem;"
+            f"font-family:JetBrains Mono,monospace;font-size:0.73rem;"
+            f"color:#60a5fa;text-decoration:none;text-align:center;'>"
+            f"🔗 Open MLflow UI ↗</a>",
+            unsafe_allow_html=True,
+        )
+
     # ── API key status banner ────────────────────
     st.markdown("<hr style='border-color:#1e2535;margin:1rem 0;'>", unsafe_allow_html=True)
     _api_ok  = st.session_state.api_key_ok
@@ -499,15 +544,33 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
 
-    col_run, col_stop = st.columns(2)
-    with col_run:
-        run_button = st.button("▶ Run", type="primary", disabled=(_api_ok is False))
-    with col_stop:
-        stop_button = st.button("⛔ Stop")
+    if is_running:
+        # Only show Stop while pipeline is active
+        run_button  = False
+        stop_button = st.button("⛔ Stop", type="primary", use_container_width=True)
+    else:
+        col_run, col_stop = st.columns([3, 1])
+        with col_run:
+            run_button = st.button(
+                "▶ Run",
+                type="primary",
+                disabled=(st.session_state.api_key_ok is False),
+                use_container_width=True,
+            )
+        with col_stop:
+            stop_button = st.button("⛔", help="Stop pipeline", use_container_width=True)
 
     if stop_button:
         st.session_state.stop = True
 
+    clear_button = st.button("🗑️ Clear Session", disabled=is_running)
+    if clear_button:
+        for key in ["latest_state", "step_status", "step_times", "log_lines",
+                    "completed", "tuning_live", "running", "stop"]:
+            st.session_state[key] = defaults[key]
+        st.rerun()
+
+    st.markdown("<div id='pipeline-status'></div>", unsafe_allow_html=True)
     sidebar_tracker = st.empty()
 
 # ─────────────────────────────────────────────
@@ -597,6 +660,8 @@ def render_sidebar_tracker(container):
 # ─────────────────────────────────────────────
 # Main Tabs
 # ─────────────────────────────────────────────
+status_bar_slot = st.empty()
+
 tab_overview, tab_insights, tab_models, tab_decisions, tab_plots, tab_state, tab_log = st.tabs([
     "📊 Overview",
     "💡 Insights",
@@ -626,6 +691,46 @@ with tab_log:
 if clear_log_clicked:
     st.session_state.log_lines = []
     st.rerun()
+
+
+def render_status_bar(container):
+    sbd = st.session_state.get("status_bar_data", {})
+    if not sbd or not st.session_state.running:
+        container.empty()
+        return
+    phase      = sbd.get("phase", "")
+    model_name = sbd.get("model_name", "")
+    m_idx      = sbd.get("model_index", 0)
+    m_tot      = sbd.get("model_total", 1)
+    t_idx      = sbd.get("trial_index", 0)
+    t_tot      = sbd.get("trial_total", 1)
+    best       = sbd.get("best_score")
+    elapsed    = sbd.get("elapsed_seconds", 0)
+    pct        = float(sbd.get("progress_pct", 0.0))
+
+    score_str   = f"{best:.4f}" if best is not None else "—"
+    elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
+
+    with container.container():
+        st.markdown(
+            f"<div class='pipeline-track' style='margin-bottom:0.5rem;'>"
+            f"<span style='color:#fbbf24;font-weight:700;text-transform:uppercase;"
+            f"font-family:JetBrains Mono,monospace;font-size:0.78rem;'>{phase}</span>"
+            f"<span style='color:#475569;font-family:JetBrains Mono,monospace;"
+            f"font-size:0.78rem;'> &nbsp;|&nbsp; </span>"
+            f"<b style='color:#e2e8f0;font-family:JetBrains Mono,monospace;"
+            f"font-size:0.78rem;'>{model_name}</b>"
+            f"<span style='color:#475569;font-family:JetBrains Mono,monospace;"
+            f"font-size:0.78rem;'> ({m_idx}/{m_tot}) &nbsp;|&nbsp; "
+            f"Trial {t_idx}/{t_tot} &nbsp;|&nbsp; Best: </span>"
+            f"<b style='color:#34d399;font-family:JetBrains Mono,monospace;"
+            f"font-size:0.78rem;'>{score_str}</b>"
+            f"<span style='color:#475569;font-family:JetBrains Mono,monospace;"
+            f"font-size:0.78rem;'> &nbsp;|&nbsp; ⏱ {elapsed_str}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        st.progress(min(pct, 1.0))
 
 
 def render_overview(container):
@@ -920,6 +1025,7 @@ def render_plots_tab(container):
 
         filter_opts = ["All", "Distribution", "Boxplot", "Correlation", "Target", "Missing"]
         if st.session_state.running:
+            st.warning("⚠️ Pipeline already running. Please wait or stop it.")
             chosen = st.session_state.get("plot_filter", "All")
         else:
             chosen = st.selectbox("Filter plots", filter_opts, key="plot_filter")
@@ -981,6 +1087,7 @@ def render_log_tab(container):
 
 
 def render_dashboard():
+    render_status_bar(status_bar_slot)
     render_sidebar_tracker(sidebar_tracker)
     render_overview(overview_slot)
     render_insights_tab(insights_slot)
@@ -997,6 +1104,20 @@ render_dashboard()
 # Run Pipeline
 # ─────────────────────────────────────────────
 if run_button:
+    # Scroll the sidebar down to the pipeline-status anchor
+    st.markdown(
+        """
+        <script>
+        (function() {
+            var el = window.parent.document.getElementById('pipeline-status');
+            if (el) { el.scrollIntoView({behavior: 'smooth', block: 'start'}); return; }
+            var sb = window.parent.document.querySelector('section[data-testid="stSidebar"]');
+            if (sb) sb.scrollTop = sb.scrollHeight;
+        })();
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
     # Save uploaded file to disk if provided (sidebar already set dataset_path)
     if uploaded_file:
         save_path = f"uploaded_{uploaded_file.name}"
@@ -1022,6 +1143,7 @@ if run_button:
     st.session_state.step_status["profiling"] = "running"
 
     graph = build_graph()
+    _pipeline_start_time = time.time()
 
     def progress_callback(event):
         history = list(st.session_state.tuning_live.get("history", []))
@@ -1034,6 +1156,32 @@ if run_button:
 
         phase = event.get("phase")
         label = event.get("label", event.get("model_id", "model"))
+
+        # ── Update live status bar ────────────────────────────────────────────
+        if phase in ("start", "start_model", "trial_complete", "best_update"):
+            sbd    = st.session_state.get("status_bar_data", {})
+            m_tot  = (event.get("model_count")
+                      or len(event.get("models", []))
+                      or sbd.get("model_total", 1))
+            m_idx  = event.get("model_index", sbd.get("model_index", 1))
+            t_idx  = event.get("trial_index", sbd.get("trial_index", 0))
+            t_tot  = event.get("trial_count", sbd.get("trial_total", 1))
+            best   = sbd.get("best_score")
+            if phase == "best_update":
+                best = event.get("cv_score") or event.get("holdout_primary_score")
+            total  = max(int(m_tot) * max(int(t_tot), 1), 1)
+            done   = (max(int(m_idx) - 1, 0)) * max(int(t_tot), 1) + int(t_idx)
+            st.session_state["status_bar_data"] = {
+                "phase":           "tuning",
+                "model_name":      label,
+                "model_index":     int(m_idx),
+                "model_total":     int(m_tot),
+                "trial_index":     int(t_idx),
+                "trial_total":     int(t_tot),
+                "best_score":      best,
+                "elapsed_seconds": time.time() - _pipeline_start_time,
+                "progress_pct":    done / total,
+            }
         if phase == "start":
             add_log(
                 f"Tuning stage started with {len(event.get('models', []))} candidate models, metric={event.get('metric')}, cv_folds={event.get('cv_folds')}, optuna_trials={event.get('optuna_trials_per_model')}.",
@@ -1065,11 +1213,14 @@ if run_button:
         render_dashboard()
 
     initial_state = {
-        "dataset_path":  dataset_path,
-        "target_column": target_column,
-        "problem_type":  problem_type,
-        "objective":     objective,
-        "_progress_callback": progress_callback,
+        "dataset_path":           dataset_path,
+        "target_column":          target_column,
+        "problem_type":           problem_type,
+        "objective":              objective,
+        "_progress_callback":     progress_callback,
+        "mlflow_experiment_name": st.session_state.get("mlflow_experiment_name", ""),
+        "mlflow_tracking_uri":    st.session_state.get("mlflow_tracking_uri", "./mlruns"),
+        "tuning_mode":            st.session_state.get("tuning_mode", "smoke_test"),
     }
 
     add_log(f"Pipeline started — target='{target_column}', type='{problem_type}'", "info")
@@ -1096,9 +1247,29 @@ if run_button:
         # Update tracking
         st.session_state.step_status[node_name] = "done"
         st.session_state.step_times[node_name]  = elapsed
+
+        # Show a baseline status bar entry while that node ran
+        if node_name == "baseline":
+            st.session_state["status_bar_data"] = {
+                "phase":           "baseline",
+                "model_name":      "Baseline Models",
+                "model_index":     1,
+                "model_total":     1,
+                "trial_index":     1,
+                "trial_total":     1,
+                "best_score":      node_output.get("baseline_result", {}).get("score"),
+                "elapsed_seconds": elapsed,
+                "progress_pct":    1.0,
+            }
         st.session_state.latest_state.update(node_output)
         if node_output.get("error"):
             error_msg = node_output["error"]
+
+            if "rate limit" in error_msg.lower() or "quota" in error_msg.lower():
+                add_log("⚠️ API limit hit. Waiting 30s before retry...", "warn")
+                time.sleep(30)
+                continue
+
             st.session_state.running = False
             st.session_state.completed = False
             add_log(f"Pipeline failed in {STEP_LABELS.get(node_name, node_name)}: {error_msg}", "error")
@@ -1131,6 +1302,49 @@ ls = st.session_state.latest_state
 if st.session_state.completed:
     total_time = sum(v for v in st.session_state.step_times.values() if isinstance(v, float))
     st.success(f"✅ Pipeline completed in {total_time:.1f}s")
+
+    _exp_url  = ls.get("mlflow_experiment_url")
+    _exp_name = ls.get("mlflow_experiment_name") or st.session_state.get("mlflow_experiment_name", "")
+    _hpo_run  = ls.get("mlflow_hpo_run_id")
+    _base_run = ls.get("mlflow_baseline_run_id")
+
+    if _exp_url or _hpo_run:
+        st.markdown(
+            f"<div style='background:#0a1f2d;border:1px solid #1e3a5f;border-radius:10px;"
+            f"padding:0.9rem 1.2rem;margin:0.5rem 0;'>"
+            f"<div style='font-family:JetBrains Mono,monospace;font-size:0.7rem;"
+            f"color:#64748b;text-transform:uppercase;letter-spacing:1px;"
+            f"margin-bottom:0.5rem;'>MLflow Experiment</div>"
+            + (
+                f"<div style='font-family:JetBrains Mono,monospace;font-size:0.82rem;"
+                f"color:#e2e8f0;margin-bottom:0.4rem;'>📋 {_exp_name}</div>"
+                if _exp_name else ""
+            )
+            + (
+                f"<a href='{_exp_url}' target='_blank' style='display:inline-block;"
+                f"background:#1e3a5f;color:#60a5fa;font-family:JetBrains Mono,monospace;"
+                f"font-size:0.78rem;padding:0.35rem 0.8rem;border-radius:6px;"
+                f"text-decoration:none;margin-right:0.5rem;'>🔗 Open MLflow UI ↗</a>"
+                if _exp_url else ""
+            )
+            + f"</div>",
+            unsafe_allow_html=True,
+        )
+        if _hpo_run or _base_run:
+            st.caption(f"HPO Run: `{_hpo_run or '—'}` | Baseline Run: `{_base_run or '—'}`")
+
+        # Re-run with cached MLflow results
+        if _hpo_run and st.button("🔄 Re-run using these MLflow results", use_container_width=False):
+            st.session_state["tuning_mode"] = "reuse_mlflow"
+            st.session_state["mlflow_experiment_name"] = _exp_name
+            st.session_state["completed"] = False
+            st.session_state["latest_state"] = {}
+            st.session_state["log_lines"] = []
+            st.session_state["step_status"] = {}
+            st.session_state["step_times"] = {}
+            st.session_state["tuning_live"] = {}
+            st.rerun()
+
     notebook_path = ls.get("notebook_path", "output_notebook.ipynb")
     if os.path.exists(str(notebook_path)):
         with open(notebook_path, "rb") as f:

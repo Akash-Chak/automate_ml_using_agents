@@ -1,0 +1,11 @@
+streamlit>=1.35
+langgraph>=0.1
+langchain-openai
+openai
+pandas
+numpy
+scikit-learn
+optuna
+nbformat
+python-dotenv
+mlflow>=2.12
