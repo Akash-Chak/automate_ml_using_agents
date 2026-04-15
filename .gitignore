@@ -213,3 +213,7 @@ outputs/
 .claude/
 mlruns
 *.csv
+logs/
+mlflow_server.log
+*.tmp.*
+*.log

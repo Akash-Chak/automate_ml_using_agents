@@ -439,6 +439,67 @@ def profiling_agent(state: dict) -> dict:
         t = info.get("semantic_type", "unknown")
         sem_counts[t] = sem_counts.get(t, 0) + 1
 
+    # ── Per-column FE recommendations ────────
+    fe_recommendations = {}
+    for col, info in column_summary.items():
+        if col == target:
+            continue
+        sem   = info.get("semantic_type", "")
+        skew  = info.get("skewness", 0)
+        neg   = info.get("negatives_count", 0)
+        out_p = info.get("iqr_outlier_pct", 0)
+        card  = info.get("cardinality_ratio", 0)
+        miss  = info.get("missing_pct", 0)
+
+        if sem in ("constant", "id"):
+            fe_recommendations[col] = {
+                "suggested_transform": "drop",
+                "reason": f"column is {sem} — no predictive value",
+                "priority": "high",
+            }
+        elif miss > 40:
+            fe_recommendations[col] = {
+                "suggested_transform": "drop",
+                "reason": f"{miss:.1f}% missing — too sparse to impute reliably",
+                "priority": "high",
+            }
+        elif sem in ("datetime", "datetime_string"):
+            fe_recommendations[col] = {
+                "suggested_transform": "cyclical",
+                "reason": "datetime column — decompose into year/month/day + cyclical sin/cos encoding for month and day-of-week",
+                "priority": "high",
+            }
+        elif abs(skew) > 1 and neg == 0:
+            fe_recommendations[col] = {
+                "suggested_transform": "log1p",
+                "reason": f"right-skewed (skew={skew:.2f}), all values ≥ 0 — log1p will normalise distribution",
+                "priority": "high" if abs(skew) > 2 else "medium",
+            }
+        elif abs(skew) > 1 and neg > 0:
+            fe_recommendations[col] = {
+                "suggested_transform": "yeo_johnson",
+                "reason": f"skewed (skew={skew:.2f}) with negative values — Yeo-Johnson handles negatives",
+                "priority": "medium",
+            }
+        elif sem == "categorical" and card > 0.2:
+            fe_recommendations[col] = {
+                "suggested_transform": "target_encode",
+                "reason": f"high cardinality ({card:.2f} ratio) — target encoding better than one-hot for high-cardinality categoricals",
+                "priority": "medium",
+            }
+        elif out_p > 15:
+            fe_recommendations[col] = {
+                "suggested_transform": "winsorize",
+                "reason": f"{out_p:.1f}% outliers (IQR) — winsorize to cap extreme values",
+                "priority": "medium",
+            }
+        else:
+            fe_recommendations[col] = {
+                "suggested_transform": None,
+                "reason": "no strong transform signal — keep as-is after standard imputation",
+                "priority": "low",
+            }
+
     # ── Recommendations for downstream agents ─
     recommendations = {
         "drop_candidates":   [c for c, i in column_summary.items()
@@ -456,6 +517,7 @@ def profiling_agent(state: dict) -> dict:
         "outlier_columns":   [c for c, i in column_summary.items()
                                if i.get("iqr_outlier_pct", 0) > 10],
         "correlated_pairs":  corr_flags,
+        "fe_recommendations": fe_recommendations,
     }
 
     profiling_report = {

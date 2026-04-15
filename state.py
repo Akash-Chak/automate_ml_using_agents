@@ -23,15 +23,7 @@ class AgentState(TypedDict, total=False):
     decision_log: Dict
     notebook_json: Dict
 
-    # MLflow experiment config (injected by Streamlit before pipeline starts)
-    mlflow_experiment_name: Optional[str]   # e.g. "train_Irrigation_Need_classification"
-    mlflow_tracking_uri:    Optional[str]   # default "./mlruns"
-    tuning_mode:            Optional[str]   # "smoke_test" | "reuse_mlflow" | "full_search"
+    tuning_mode:            Optional[str]   # "smoke_test" | "full_search"
 
-    # MLflow run IDs populated by agents
-    mlflow_baseline_run_id: Optional[str]
-    mlflow_hpo_run_id:      Optional[str]
-    mlflow_experiment_url:  Optional[str]   # clickable link shown in UI
-
-    # callback injected by the Streamlit app; not serialised — kept as-is by LangGraph
+    # callback injected by the UI; not serialised — kept as-is by LangGraph
     _progress_callback: Optional[Callable]

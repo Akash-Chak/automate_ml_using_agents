@@ -29,21 +29,41 @@ def _code(text: str) -> nbf.NotebookNode:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_preprocessing(preprocessing_report: dict) -> dict:
-    dropped = list(preprocessing_report.get("dropped_columns", []))
+    dropped     = list(preprocessing_report.get("dropped_columns", []))
     transformed = preprocessing_report.get("transformed_columns", [])
-    encoded = preprocessing_report.get("encoded_columns", {"frequency": [], "one_hot": []})
+    encoded     = preprocessing_report.get("encoded_columns", {"frequency": [], "one_hot": [], "target_encode": []})
+    fe_steps    = preprocessing_report.get("fe_steps_applied", [])
 
-    log_cols = [c.split(":")[0] for c in transformed if ":log1p" in c]
+    log_cols        = [c.split(":")[0] for c in transformed if ":log1p" in c]
+    yj_cols         = [c.split(":")[0] for c in transformed if ":yeo_johnson" in c]
     winsorized_cols = [c.split(":")[0] for c in transformed if ":winsorized" in c]
-    freq_cols = list(encoded.get("frequency", []))
-    ohe_cols = list(encoded.get("one_hot", []))
+    binned_cols     = [c.split(":")[0] for c in transformed if ":bin_quantile" in c]
+    freq_cols       = list(encoded.get("frequency", []))
+    ohe_cols        = list(encoded.get("one_hot", []))
+    te_cols         = list(encoded.get("target_encode", []))
+
+    # Interaction features created
+    interactions = [
+        s for s in fe_steps if s.get("action") == "interaction"
+    ]
+    # Cyclical datetime columns
+    cyclical_cols = [
+        s["col"] for s in fe_steps if s.get("method") == "cyclical"
+    ]
 
     return {
-        "dropped": dropped,
-        "log_cols": log_cols,
-        "winsorized_cols": winsorized_cols,
-        "freq_cols": freq_cols,
-        "ohe_cols": ohe_cols,
+        "dropped":          dropped,
+        "log_cols":         log_cols,
+        "yj_cols":          yj_cols,
+        "winsorized_cols":  winsorized_cols,
+        "binned_cols":      binned_cols,
+        "freq_cols":        freq_cols,
+        "ohe_cols":         ohe_cols,
+        "te_cols":          te_cols,
+        "interactions":     interactions,
+        "cyclical_cols":    cyclical_cols,
+        "fe_steps":         fe_steps,
+        "llm_fe_used":      preprocessing_report.get("llm_fe_used", False),
     }
 
 
@@ -204,7 +224,7 @@ def _section_mlflow_info(state: dict) -> list:
     if not (hpo_run or base_run):
         return []
 
-    lines = ["## MLflow Experiment Tracking", ""]
+    lines = ["# MLflow Experiment Tracking", ""]
     if exp_name:
         lines.append(f"- **Experiment:** `{exp_name}`")
     if base_run:
@@ -262,18 +282,55 @@ and hyperparameter tuning are driven by data-analysis agents. Run cells top-to-b
 """)]
 
 
-def _section_setup() -> list:
+def _section_setup(state: dict) -> list:
+    problem_type = state.get("problem_type", "classification")
+    is_cls = problem_type == "classification"
+
+    if is_cls:
+        model_imports = """\
+from sklearn.dummy import DummyClassifier
+from sklearn.linear_model import LogisticRegression, RidgeClassifier
+from sklearn.svm import LinearSVC, SVC
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import (
+    RandomForestClassifier, ExtraTreesClassifier,
+    GradientBoostingClassifier, HistGradientBoostingClassifier,
+    AdaBoostClassifier, BaggingClassifier,
+)
+from sklearn.neural_network import MLPClassifier"""
+        xgb_import  = "from xgboost import XGBClassifier"
+        lgbm_import = "from lightgbm import LGBMClassifier"
+    else:
+        model_imports = """\
+from sklearn.dummy import DummyRegressor
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
+from sklearn.svm import LinearSVR, SVR
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import (
+    RandomForestRegressor, ExtraTreesRegressor,
+    GradientBoostingRegressor, HistGradientBoostingRegressor,
+    AdaBoostRegressor, BaggingRegressor,
+)
+from sklearn.neural_network import MLPRegressor"""
+        xgb_import  = "from xgboost import XGBRegressor"
+        lgbm_import = "from lightgbm import LGBMRegressor"
+
     return [
-        _md("## Setup\n\nImport all libraries needed for the full ML pipeline."),
-        _code("""\
+        _md("# Setup\n\nImport all libraries needed for the full ML pipeline."),
+        _code(f"""\
 import warnings
 warnings.filterwarnings("ignore")
 
 import os
+import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+from scipy import stats
 
 from sklearn.model_selection import (
     train_test_split, cross_val_score, StratifiedKFold, KFold
@@ -284,33 +341,17 @@ from sklearn.metrics import (
     confusion_matrix, ConfusionMatrixDisplay,
     r2_score, mean_absolute_error, mean_squared_error,
 )
-from sklearn.dummy import DummyClassifier, DummyRegressor
-from sklearn.linear_model import (
-    LogisticRegression, Ridge, Lasso, ElasticNet, RidgeClassifier,
-    LinearRegression,
-)
-from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
-from sklearn.ensemble import (
-    RandomForestClassifier,    RandomForestRegressor,
-    GradientBoostingClassifier, GradientBoostingRegressor,
-    ExtraTreesClassifier,      ExtraTreesRegressor,
-    HistGradientBoostingClassifier, HistGradientBoostingRegressor,
-    AdaBoostClassifier,        AdaBoostRegressor,
-    BaggingClassifier,         BaggingRegressor,
-)
-from sklearn.svm import LinearSVC, SVC, LinearSVR, SVR
-from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
-from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.pipeline import Pipeline
+{model_imports}
 
 try:
-    from xgboost import XGBClassifier, XGBRegressor
+    {xgb_import}
     HAS_XGB = True
 except ImportError:
     HAS_XGB = False
 
 try:
-    from lightgbm import LGBMClassifier, LGBMRegressor
+    {lgbm_import}
     HAS_LGBM = True
 except ImportError:
     HAS_LGBM = False
@@ -326,7 +367,7 @@ except ImportError:
 plt.style.use("seaborn-v0_8-whitegrid")
 sns.set_palette("husl")
 pd.set_option("display.max_columns", None)
-pd.set_option("display.float_format", lambda x: f"{x:.4f}")
+pd.set_option("display.float_format", lambda x: f"{{x:.4f}}")
 
 RANDOM_STATE = 42
 print("Environment ready.")
@@ -347,7 +388,7 @@ def _section_data_loading(state: dict) -> list:
         test_path = root + "_test" + ext
 
     return [
-        _md("## 1. Data Loading & Initial Exploration"),
+        _md("# 1. Data Loading & Initial Exploration"),
         _code(f"""\
 TARGET       = {repr(target)}
 TRAIN_PATH   = r{repr(dataset_path)}
@@ -391,15 +432,10 @@ def _section_eda(state: dict) -> list:
     target = state.get("target_column", "target")
     problem_type = state.get("problem_type", "classification")
     eda_report = state.get("eda_report", {})
-    stats_report = state.get("stats_report", {})
 
     insights = eda_report.get("insights", [])[:8]
     insights_md = "\n".join(f"- {i}" for i in insights) if insights else "- No insights available."
 
-    top_feats = _top_features(stats_report, top_n=6)
-    top_feats_repr = repr(top_feats)
-
-    target_plot = ""
     if problem_type == "classification":
         target_plot = """\
 tc = df[TARGET].value_counts()
@@ -437,59 +473,82 @@ plt.tight_layout(); plt.show()
 print(df[TARGET].describe())"""
 
     return [
-        _md(f"""\
-## 2. Exploratory Data Analysis
-
-### Key insights from agent analysis
-
-{insights_md}
-"""),
+        _md("# 2. Exploratory Data Analysis\n\nVisualise the target variable and every feature in the dataset."),
         _code(f"""\
 # ── Target distribution ──────────────────────────────────────────
 {target_plot}
 """),
-        _code(f"""\
-# ── Top significant feature distributions ────────────────────────
-TOP_FEATURES = {top_feats_repr}
-TOP_FEATURES = [f for f in TOP_FEATURES if f in df.columns][:6]
+        _code("""\
+# ── All numeric feature distributions ────────────────────────────
+num_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c != TARGET]
+N_PER_ROW = 4
+n_rows = math.ceil(len(num_cols) / N_PER_ROW) if num_cols else 1
 
-if TOP_FEATURES:
-    n_cols = 3
-    n_rows = (len(TOP_FEATURES) + n_cols - 1) // n_cols
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, n_rows * 4))
-    axes_flat = np.array(axes).flatten()
+if num_cols:
+    fig, axes = plt.subplots(n_rows, N_PER_ROW, figsize=(16, n_rows * 4))
+    axes_flat = np.array(axes).flatten() if (n_rows > 1 or N_PER_ROW > 1) else [axes]
 
-    for i, col in enumerate(TOP_FEATURES):
+    for i, col in enumerate(num_cols):
         ax = axes_flat[i]
-        if pd.api.types.is_numeric_dtype(df[col]):
-            ax.hist(df[col].dropna(), bins=30, density=True,
-                    alpha=0.7, color="#6366f1", edgecolor="white")
-            ax.set_title(col, fontweight="bold", fontsize=11)
-            ax.set_xlabel(col); ax.set_ylabel("Density")
-        else:
-            vc = df[col].value_counts().head(10)
-            ax.bar(vc.index.astype(str), vc.values, color="#6366f1", alpha=0.8)
-            ax.set_title(col, fontweight="bold", fontsize=11)
-            ax.set_xlabel(col); ax.set_ylabel("Count")
-            ax.tick_params(axis="x", rotation=45)
+        data = df[col].dropna()
+        ax.hist(data, bins=30, density=True, alpha=0.65, color="#6366f1", edgecolor="white")
+        try:
+            from scipy.stats import gaussian_kde
+            if len(data) > 1 and data.std() > 0:
+                kde = gaussian_kde(data)
+                xs = np.linspace(data.min(), data.max(), 200)
+                ax.plot(xs, kde(xs), color="#ef4444", lw=2)
+        except Exception:
+            pass
+        ax.set_title(col, fontweight="bold", fontsize=10)
+        ax.set_xlabel(col); ax.set_ylabel("Density")
 
-    for j in range(len(TOP_FEATURES), len(axes_flat)):
+    for j in range(len(num_cols), len(axes_flat)):
         axes_flat[j].set_visible(False)
 
-    plt.suptitle("Top Feature Distributions", fontsize=14, fontweight="bold")
+    plt.suptitle("Numeric Feature Distributions", fontsize=14, fontweight="bold")
     plt.tight_layout(); plt.show()
+else:
+    print("No numeric features found.")
 """),
-        _code(f"""\
-# ── Correlation heatmap ───────────────────────────────────────────
-num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        _code("""\
+# ── All categorical feature distributions ────────────────────────
+cat_cols = [c for c in df.select_dtypes(exclude=[np.number]).columns if c != TARGET]
+N_PER_ROW = 4
+n_rows = math.ceil(len(cat_cols) / N_PER_ROW) if cat_cols else 1
 
-if len(num_cols) >= 2:
-    target_in_num = TARGET in num_cols
+if cat_cols:
+    fig, axes = plt.subplots(n_rows, N_PER_ROW, figsize=(16, n_rows * 4))
+    axes_flat = np.array(axes).flatten() if (n_rows > 1 or N_PER_ROW > 1) else [axes]
+
+    for i, col in enumerate(cat_cols):
+        ax = axes_flat[i]
+        vc = df[col].value_counts().head(10)
+        ax.bar(range(len(vc)), vc.values, color="#6366f1", alpha=0.8)
+        ax.set_xticks(range(len(vc)))
+        ax.set_xticklabels(vc.index.astype(str), rotation=45, ha="right", fontsize=8)
+        ax.set_title(col, fontweight="bold", fontsize=10)
+        ax.set_ylabel("Count")
+
+    for j in range(len(cat_cols), len(axes_flat)):
+        axes_flat[j].set_visible(False)
+
+    plt.suptitle("Categorical Feature Distributions", fontsize=14, fontweight="bold")
+    plt.tight_layout(); plt.show()
+else:
+    print("No categorical features found.")
+"""),
+        _code("""\
+# ── Correlation heatmap ───────────────────────────────────────────
+num_cols_all = df.select_dtypes(include=[np.number]).columns.tolist()
+
+if len(num_cols_all) >= 2:
+    target_in_num = TARGET in num_cols_all
     if target_in_num:
-        tc_abs = df[num_cols].corr()[TARGET].abs().sort_values(ascending=False)
+        tc_abs = df[num_cols_all].corr()[TARGET].abs().sort_values(ascending=False)
         plot_cols = tc_abs.head(20).index.tolist()
     else:
-        plot_cols = num_cols[:20]
+        plot_cols = num_cols_all[:20]
 
     corr = df[plot_cols].corr()
     fig, axes = plt.subplots(1, 2 if target_in_num else 1,
@@ -504,7 +563,7 @@ if len(num_cols) >= 2:
     axes[0].set_title("Feature Correlation Heatmap", fontsize=13, fontweight="bold")
 
     if target_in_num:
-        tc = df[num_cols].corr()[TARGET].drop(TARGET).abs() \\
+        tc = df[num_cols_all].corr()[TARGET].drop(TARGET).abs() \\
                .sort_values(ascending=False).head(15)
         colors = ["#22c55e" if v > 0.3 else "#f59e0b" if v > 0.1 else "#64748b"
                   for v in tc.values]
@@ -517,15 +576,20 @@ if len(num_cols) >= 2:
 
     plt.tight_layout(); plt.show()
 """),
+        _md(f"""\
+## Key Insights from Agent Analysis
+
+{insights_md}
+"""),
     ]
 
 
 def _section_statistical_analysis(state: dict) -> list:
-    stats_report = state.get("stats_report", {})
+    stats_report  = state.get("stats_report", {})
+    problem_type  = state.get("problem_type", "classification")
 
     significant   = stats_report.get("significant_after_fdr", [])
     insignificant = stats_report.get("insignificant", [])
-    ranked        = stats_report.get("ranked_features", [])[:20]
     large_effect  = stats_report.get("large_effect_features", [])
     medium_effect = stats_report.get("medium_effect_features", [])
 
@@ -533,34 +597,208 @@ def _section_statistical_analysis(state: dict) -> list:
     large_str   = ", ".join(f"`{f}`" for f in large_effect[:8]) or "None"
     medium_str  = ", ".join(f"`{f}`" for f in medium_effect[:8]) or "None"
 
-    ranked_json = json.dumps(ranked, indent=2)
-    large_json  = json.dumps(large_effect)
-    medium_json = json.dumps(medium_effect)
+    is_cls = problem_type == "classification"
+    num_test_comment = "Mann-Whitney U (2-class) or Kruskal-Wallis (multi-class)" if is_cls else "Spearman correlation"
+    cat_test_comment = "Chi-square contingency test" if is_cls else "Kruskal-Wallis H-test"
 
     return [
-        _md(f"""\
-## 3. Statistical Feature Significance
-
-Statistical tests (t-test / Mann-Whitney / ANOVA / Kruskal-Wallis / Chi-square / Correlation)
-were run on every feature. Benjamini-Hochberg FDR correction was applied.
-
-**Significant ({len(significant)} features, p < 0.05 after FDR):**
-
-{sig_bullets}
-
-**Large effect size:** {large_str}
-**Medium effect size:** {medium_str}
-**Insignificant / deprioritised:** {len(insignificant)} features
-"""),
+        _md("# 3. Statistical Feature Significance\n\n"
+            "Run statistical tests on every feature to measure its relationship with the target. "
+            "Benjamini-Hochberg FDR correction is applied to control false discoveries."),
         _code(f"""\
-# ── Feature significance visualisation ───────────────────────────
-ranked_features = {ranked_json}
-large_effect    = {large_json}
-medium_effect   = {medium_json}
+# ── Run statistical tests on all features ────────────────────────
+# Numeric vs target : {num_test_comment}
+# Categorical vs target : {cat_test_comment}
+# FDR correction : Benjamini-Hochberg
 
+feature_cols = [c for c in df.columns if c != TARGET]
+num_feats = df[feature_cols].select_dtypes(include=[np.number]).columns.tolist()
+cat_feats = df[feature_cols].select_dtypes(exclude=[np.number]).columns.tolist()
+n_classes = df[TARGET].nunique()
+
+def _bh_correction(p_values):
+    # Benjamini-Hochberg FDR correction (no external dependency)
+    p = np.array(p_values, dtype=float)
+    n = len(p)
+    if n == 0:
+        return p
+    idx   = np.argsort(p)
+    adj   = p[idx] * n / (np.arange(1, n + 1))
+    # Enforce monotonicity right-to-left
+    for i in range(n - 2, -1, -1):
+        adj[i] = min(adj[i], adj[i + 1])
+    adj = np.minimum(adj, 1.0)
+    result = np.empty_like(adj)
+    result[idx] = adj
+    return result
+
+stat_rows = []
+
+for col in num_feats:
+    sub = df[[col, TARGET]].dropna()
+    x, y = sub[col].values, sub[TARGET].values
+    try:
+        if PROBLEM_TYPE == "classification":
+            classes = np.unique(y)
+            groups  = [x[y == c] for c in classes if (y == c).sum() >= 3]
+            if len(groups) < 2:
+                continue
+            if len(groups) == 2:
+                stat, p = stats.mannwhitneyu(groups[0], groups[1], alternative="two-sided")
+                test_name = "Mann-Whitney U"
+            else:
+                stat, p = stats.kruskal(*groups)
+                test_name = "Kruskal-Wallis"
+        else:
+            stat, p = stats.spearmanr(x, y)
+            test_name = "Spearman r"
+        stat_rows.append({{"feature": col, "dtype": "numeric", "test": test_name,
+                           "statistic": round(float(stat), 4), "p_value": float(p)}})
+    except Exception as e:
+        print(f"  Skipped {{col}}: {{e}}")
+
+for col in cat_feats:
+    sub = df[[col, TARGET]].dropna()
+    try:
+        if PROBLEM_TYPE == "classification":
+            ct = pd.crosstab(sub[col], sub[TARGET])
+            if ct.shape[0] < 2 or ct.shape[1] < 2:
+                continue
+            stat, p, _, _ = stats.chi2_contingency(ct)
+            test_name = "Chi-square"
+        else:
+            groups = [sub[TARGET][sub[col] == v].values
+                      for v in sub[col].unique() if (sub[col] == v).sum() >= 3]
+            if len(groups) < 2:
+                continue
+            stat, p = stats.kruskal(*groups)
+            test_name = "Kruskal-Wallis"
+        stat_rows.append({{"feature": col, "dtype": "categorical", "test": test_name,
+                           "statistic": round(float(stat), 4), "p_value": float(p)}})
+    except Exception as e:
+        print(f"  Skipped {{col}}: {{e}}")
+
+stat_df = pd.DataFrame(stat_rows).sort_values("p_value").reset_index(drop=True)
+
+if not stat_df.empty:
+    stat_df["p_value_fdr"] = _bh_correction(stat_df["p_value"].values)
+    stat_df["significant"] = stat_df["p_value_fdr"] < 0.05
+    print(f"Features tested          : {{len(stat_df)}}")
+    print(f"Significant (p_fdr<0.05) : {{stat_df['significant'].sum()}}")
+    display(stat_df.style.format({{"p_value": "{{:.4e}}", "p_value_fdr": "{{:.4e}}",
+                                   "statistic": "{{:.4f}}"}}))
+else:
+    print("No features could be tested.")
+    stat_df = pd.DataFrame(columns=["feature", "dtype", "test", "statistic", "p_value", "p_value_fdr", "significant"])
+"""),
+        _code("""\
+# ── Compute effect sizes, MI scores and rank features ────────────
+from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
+from matplotlib.patches import Patch
+
+def _cramers_v_nb(ct):
+    chi2 = stats.chi2_contingency(ct)[0]
+    n = ct.values.sum()
+    r, c = ct.shape
+    return float(np.sqrt(chi2 / (n * (min(r, c) - 1)))) if min(r, c) > 1 else 0.0
+
+def _cohens_d_nb(g1, g2):
+    pooled = np.sqrt((np.std(g1) ** 2 + np.std(g2) ** 2) / 2)
+    return float((np.mean(g1) - np.mean(g2)) / pooled) if pooled > 0 else 0.0
+
+def _epsilon_sq_nb(H, n, k):
+    return float((H - k + 1) / (n - k)) if n > k else 0.0
+
+def _effect_label_nb(size, metric):
+    a = abs(size)
+    if metric in ("cramers_v", "epsilon_squared", "eta_squared"):
+        if a >= 0.50: return "large"
+        if a >= 0.30: return "medium"
+        if a >= 0.10: return "small"
+        return "negligible"
+    if metric == "cohens_d":
+        if a >= 0.80: return "large"
+        if a >= 0.50: return "medium"
+        if a >= 0.20: return "small"
+        return "negligible"
+    # spearman / pearson r
+    if a >= 0.50: return "large"
+    if a >= 0.30: return "medium"
+    if a >= 0.10: return "small"
+    return "negligible"
+
+effect_map = {}
+for _, row in stat_df.iterrows():
+    col  = row["feature"]
+    sub  = df[[col, TARGET]].dropna()
+    x, y = sub[col].values, sub[TARGET].values
+    test = row["test"]
+    try:
+        if test == "Mann-Whitney U":
+            classes = np.unique(y)
+            g1, g2  = x[y == classes[0]], x[y == classes[1]]
+            es = _cohens_d_nb(g1, g2)
+            effect_map[col] = (round(es, 4), "cohens_d")
+        elif test == "Kruskal-Wallis":
+            if PROBLEM_TYPE == "classification":
+                H, n, k = row["statistic"], len(x), len(np.unique(y))
+            else:
+                H, n, k = row["statistic"], len(y), len(np.unique(x))
+            effect_map[col] = (round(_epsilon_sq_nb(H, n, k), 4), "epsilon_squared")
+        elif test == "Chi-square":
+            ct = pd.crosstab(sub[col], sub[TARGET])
+            effect_map[col] = (round(_cramers_v_nb(ct), 4), "cramers_v")
+        elif test in ("Spearman r", "Pearson r"):
+            effect_map[col] = (round(abs(float(row["statistic"])), 4), "spearman_r")
+        else:
+            effect_map[col] = (0.0, "unknown")
+    except Exception:
+        effect_map[col] = (0.0, "unknown")
+
+# MI scores (normalised to [0, 1] for ranking)
+X_mi = df[feature_cols].copy()
+for c in cat_feats:
+    X_mi[c] = X_mi[c].astype("category").cat.codes
+X_mi = X_mi.fillna(X_mi.median(numeric_only=True))
+if PROBLEM_TYPE == "classification":
+    mi_raw = mutual_info_classif(X_mi, df[TARGET], random_state=42)
+else:
+    mi_raw = mutual_info_regression(X_mi, df[TARGET], random_state=42)
+mi_map = dict(zip(feature_cols, mi_raw))
+max_mi = max(mi_map.values()) if mi_map else 1.0
+if max_mi == 0:
+    max_mi = 1.0
+
+ranked_features = []
+for _, row in stat_df.iterrows():
+    col        = row["feature"]
+    es, metric = effect_map.get(col, (0.0, "unknown"))
+    mi_val     = float(mi_map.get(col, 0.0))
+    mi_norm    = mi_val / max_mi
+    combined   = round(max(abs(es), mi_norm), 4)
+    ranked_features.append({
+        "feature":               col,
+        "test":                  row["test"],
+        "p_value":               round(float(row["p_value"]), 6),
+        "p_adjusted":            round(float(row["p_value_fdr"]), 6),
+        "effect_size":           es,
+        "effect_label":          _effect_label_nb(es, metric),
+        "mi_score":              round(mi_val, 4),
+        "combined_score":        combined,
+        "significant":           bool(row["significant"]),
+        "significant_after_fdr": bool(row["significant"]),
+    })
+
+ranked_features.sort(key=lambda r: (-int(r["significant_after_fdr"]), -r["combined_score"]))
+large_effect  = [r["feature"] for r in ranked_features if r["effect_label"] == "large"]
+medium_effect = [r["feature"] for r in ranked_features if r["effect_label"] == "medium"]
+print(f"Large effect features  : {large_effect  or 'none'}")
+print(f"Medium effect features : {medium_effect or 'none'}")
+"""),
+        _code("""\
+# ── Visualise effect size and significance ────────────────────────
 if ranked_features:
     rdf = pd.DataFrame(ranked_features)
-
     fig, axes = plt.subplots(1, 2, figsize=(16, max(5, len(rdf) * 0.4)))
 
     if "effect_size" in rdf.columns:
@@ -573,30 +811,58 @@ if ranked_features:
         axes[0].barh(rdf_s["feature"].astype(str), rdf_s["effect_size"], color=colors)
         axes[0].set_title("Feature Effect Size", fontsize=13, fontweight="bold")
         axes[0].set_xlabel("Effect Size")
-        from matplotlib.patches import Patch
         axes[0].legend(handles=[
             Patch(color="#22c55e", label="Large"),
             Patch(color="#f59e0b", label="Medium"),
-            Patch(color="#64748b", label="Small"),
+            Patch(color="#64748b", label="Small/Negligible"),
         ])
 
-    if "p_value" in rdf.columns:
-        rdf["neg_log_p"] = -np.log10(rdf["p_value"].clip(lower=1e-300))
+    if "p_adjusted" in rdf.columns:
+        rdf["neg_log_p"] = -np.log10(rdf["p_adjusted"].clip(lower=1e-300))
         rdf_s2 = rdf.sort_values("neg_log_p", ascending=True).tail(15)
-        c2 = ["#22c55e" if p < 0.01 else "#f59e0b" if p < 0.05 else "#64748b"
-               for p in rdf_s2["p_value"]]
+        c2 = ["#22c55e" if p < 0.001 else "#f59e0b" if p < 0.01 else "#6366f1"
+               for p in rdf_s2["p_adjusted"]]
         axes[1].barh(rdf_s2["feature"].astype(str), rdf_s2["neg_log_p"], color=c2)
-        axes[1].axvline(-np.log10(0.05), color="orange", ls="--", label="p = 0.05")
-        axes[1].set_title("-log₁₀(p-value)", fontsize=13, fontweight="bold")
-        axes[1].set_xlabel("-log₁₀(p)")
+        axes[1].axvline(-np.log10(0.05), color="red", ls="--", label="FDR = 0.05")
+        axes[1].set_title("-log₁₀(FDR p-value)", fontsize=13, fontweight="bold")
+        axes[1].set_xlabel("-log₁₀(p_fdr)")
         axes[1].legend()
 
     plt.suptitle("Statistical Feature Significance", fontsize=14, fontweight="bold")
     plt.tight_layout(); plt.show()
-else:
-    print("No ranked-feature data available.")
+"""),
+        _md(f"""\
+## Interpretation
+
+Based on the statistical tests above:
+
+**Significant features ({len(significant)} features, p_fdr < 0.05):**
+
+{sig_bullets}
+
+**Large effect size:** {large_str}
+**Medium effect size:** {medium_str}
+**Insignificant / deprioritised:** {len(insignificant)} features
+
+Features with large effect sizes and low FDR-corrected p-values are the most informative
+predictors. Use these findings to guide feature selection and engineering in the next section.
 """),
     ]
+
+
+def _fe_steps_md(fe_steps: list) -> str:
+    """Render a human-readable summary of FE steps for the notebook markdown cell."""
+    if not fe_steps:
+        return "  - Standard imputation + encoding pipeline applied."
+    lines = []
+    for s in fe_steps:
+        col    = s.get("col", "?")
+        action = s.get("action", "")
+        method = s.get("method") or ""
+        reason = s.get("reason", "")
+        method_str = f" ({method})" if method else ""
+        lines.append(f"  - **{col}** → `{action}{method_str}`: {reason}")
+    return "\n".join(lines)
 
 
 def _section_preprocessing(state: dict) -> list:
@@ -606,35 +872,98 @@ def _section_preprocessing(state: dict) -> list:
     cfg = _parse_preprocessing(preprocessing_report)
     dropped       = cfg["dropped"]
     log_cols      = cfg["log_cols"]
+    yj_cols       = cfg["yj_cols"]
     winsorized    = cfg["winsorized_cols"]
+    binned_cols   = cfg["binned_cols"]
     freq_cols     = cfg["freq_cols"]
     ohe_cols      = cfg["ohe_cols"]
+    te_cols       = cfg["te_cols"]
+    interactions  = cfg["interactions"]
+    cyclical_cols = cfg["cyclical_cols"]
+    fe_steps      = cfg["fe_steps"]
+    llm_fe_used   = cfg["llm_fe_used"]
 
     steps   = preprocessing_report.get("steps", [])
     n_orig  = preprocessing_report.get("original_feature_count", "?")
     n_final = preprocessing_report.get("selected_feature_count", "?")
+    n_int   = preprocessing_report.get("interactions_created", 0)
 
-    steps_md = "\n".join(f"  - {s.replace('_', ' ').title()}" for s in steps) or "  - Standard pipeline"
+    steps_md  = "\n".join(f"  - {s.replace('_', ' ').title()}" for s in steps) or "  - Standard pipeline"
+    fe_md     = _fe_steps_md(fe_steps)
+    llm_note  = "*(LLM-directed feature engineering)*" if llm_fe_used else "*(rule-based feature engineering)*"
 
     winsorize_cols_all = list(set(winsorized + log_cols))
 
+    interaction_code = ""
+    if interactions:
+        lines = []
+        for ix in interactions:
+            ca, cb, itype = ix.get("col_a"), ix.get("col_b"), ix.get("method", "ratio")
+            if itype == "ratio":
+                lines.append(f'    X["{ca}_div_{cb}"] = X["{ca}"] / X["{cb}"].replace(0, np.nan).fillna(0)')
+            elif itype == "product":
+                lines.append(f'    X["{ca}_x_{cb}"] = X["{ca}"] * X["{cb}"]')
+            elif itype == "difference":
+                lines.append(f'    X["{ca}_minus_{cb}"] = X["{ca}"] - X["{cb}"]')
+        interaction_code = "\n    # ── Interaction features (LLM-recommended) ──\n" + "\n".join(lines)
+
+    te_code = ""
+    if te_cols:
+        te_code = f"""
+    # ── Target encoding (5-fold LOO mean encoding) ──
+    from sklearn.model_selection import KFold
+    TE_COLS = {repr(te_cols)}
+    if y is not None:
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        for c in TE_COLS:
+            if c in X.columns:
+                global_mean = float(y.mean())
+                encoded = pd.Series(global_mean, index=X.index, dtype=float)
+                for tr_idx, val_idx in kf.split(X):
+                    means = y.iloc[tr_idx].groupby(X[c].iloc[tr_idx].values).mean()
+                    encoded.iloc[val_idx] = X[c].iloc[val_idx].map(means).fillna(global_mean).values
+                X[f"{{c}}_te"] = encoded
+                X = X.drop(columns=[c])"""
+
+    yj_code = ""
+    if yj_cols:
+        yj_code = f"""
+    # ── Yeo-Johnson transform (skewed with negatives) ──
+    from scipy.stats import yeojohnson
+    YJ_COLS = {repr(yj_cols)}
+    for c in YJ_COLS:
+        if c in X.columns:
+            clean = X[c].dropna().values
+            transformed, _ = yeojohnson(clean)
+            X.loc[~X[c].isna(), c] = transformed"""
+
     return [
         _md(f"""\
-## 4. Data Preprocessing
+# 4. Data Preprocessing & Feature Engineering
 
-### Agent preprocessing decisions
+{llm_note}
 
-The preprocessing agent analysed the data and applied:
+## Pipeline Steps Applied
 
 {steps_md}
+
+## Feature Engineering Decisions (per column)
+
+{fe_md}
 
 | Metric | Value |
 |--------|-------|
 | Original features | {n_orig} |
 | Dropped (bad/irrelevant) | {len(dropped)} |
 | Log-transformed | {len(log_cols)} |
+| Yeo-Johnson transformed | {len(yj_cols)} |
+| Winsorized | {len(winsorized)} |
+| Quantile-binned | {len(binned_cols)} |
+| Target-encoded | {len(te_cols)} |
 | Frequency encoded | {len(freq_cols)} |
 | One-hot encoded | {len(ohe_cols)} |
+| Cyclical datetime cols | {len(cyclical_cols)} |
+| Interaction features created | {n_int} |
 | **Final feature count** | **{n_final}** |
 """),
         _code(f"""\
@@ -642,16 +971,23 @@ The preprocessing agent analysed the data and applied:
 # Preprocessing Configuration  (derived from agent analysis)
 # ═══════════════════════════════════════════════════════════════
 
-COLS_TO_DROP      = {repr(dropped)}
-LOG_TRANSFORM_COLS= {repr(log_cols)}
-WINSORIZE_COLS    = {repr(winsorize_cols_all)}   # capped before log-transform
-FREQ_ENCODE_COLS  = {repr(freq_cols)}
-OHE_COLS          = {repr(ohe_cols)}
+COLS_TO_DROP       = {repr(dropped)}
+LOG_TRANSFORM_COLS = {repr(log_cols)}
+YJ_TRANSFORM_COLS  = {repr(yj_cols)}
+WINSORIZE_COLS     = {repr(winsorize_cols_all)}
+BIN_QUANTILE_COLS  = {repr(binned_cols)}
+FREQ_ENCODE_COLS   = {repr(freq_cols)}
+OHE_COLS           = {repr(ohe_cols)}
+TARGET_ENCODE_COLS = {repr(te_cols)}
+CYCLICAL_COLS      = {repr(cyclical_cols)}
 
-print(f"Drop        : {{len(COLS_TO_DROP)}} cols")
-print(f"Log-transform : {{len(LOG_TRANSFORM_COLS)}} cols")
-print(f"Freq-encode  : {{len(FREQ_ENCODE_COLS)}} cols")
-print(f"One-hot      : {{len(OHE_COLS)}} cols")
+print(f"Drop           : {{len(COLS_TO_DROP)}} cols")
+print(f"Log-transform  : {{len(LOG_TRANSFORM_COLS)}} cols")
+print(f"Yeo-Johnson    : {{len(YJ_TRANSFORM_COLS)}} cols")
+print(f"Target-encode  : {{len(TARGET_ENCODE_COLS)}} cols")
+print(f"Freq-encode    : {{len(FREQ_ENCODE_COLS)}} cols")
+print(f"One-hot        : {{len(OHE_COLS)}} cols")
+print(f"Interactions   : {n_int}")
 """),
         _code(f"""\
 # ═══════════════════════════════════════════════════════════════
@@ -689,12 +1025,35 @@ def fit_preprocessor(df, target_col=TARGET):
                 iqr_bounds[c] = (lo, hi)
                 X[c] = X[c].clip(lower=lo, upper=hi)
 
-    # 4. Log-transform skewed columns
+    # 4. Log-transform skewed positive columns
     for c in LOG_TRANSFORM_COLS:
         if c in X.columns:
             X[c] = np.log1p(X[c].clip(lower=0))
+{yj_code}
+    # 5. Quantile binning for non-linear features
+    for c in BIN_QUANTILE_COLS:
+        if c in X.columns:
+            try:
+                X[c] = pd.qcut(X[c], q=5, labels=False, duplicates="drop").astype(float)
+            except Exception:
+                pass
+{interaction_code}
+    # 6. Target encoding (if applicable — uses global mean on test set)
+    TE_COLS = TARGET_ENCODE_COLS
+    if y is not None and TE_COLS:
+        from sklearn.model_selection import KFold
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        for c in TE_COLS:
+            if c in X.columns:
+                gm = float(y.mean())
+                enc = pd.Series(gm, index=X.index, dtype=float)
+                for tr, va in kf.split(X):
+                    m = y.iloc[tr].groupby(X[c].iloc[tr].values).mean()
+                    enc.iloc[va] = X[c].iloc[va].map(m).fillna(gm).values
+                X[f"{{c}}_te"] = enc
+                X = X.drop(columns=[c])
 
-    # 5. Frequency encode high-cardinality categoricals
+    # 7. Frequency encode high-cardinality categoricals
     freq_maps = {{}}
     for c in FREQ_ENCODE_COLS:
         if c in X.columns:
@@ -703,14 +1062,14 @@ def fit_preprocessor(df, target_col=TARGET):
             X[f"{{c}}_freq"] = X[c].map(fm).fillna(0.0)
             X = X.drop(columns=[c])
 
-    # 6. One-hot encode remaining categoricals
+    # 8. One-hot encode remaining categoricals
     ohe_present = [c for c in OHE_COLS if c in X.columns]
     if ohe_present:
         X = pd.get_dummies(X, columns=ohe_present, drop_first=True)
 
     feature_names = X.columns.tolist()
 
-    # 7. Scale all numeric features
+    # 9. Scale all numeric features
     scale_cols = X.select_dtypes(include=[np.number]).columns.tolist()
     scaler = StandardScaler()
     X[scale_cols] = scaler.fit_transform(X[scale_cols])
@@ -780,9 +1139,6 @@ def _section_baseline_models(state: dict) -> list:
     best_score   = baseline_result.get("score") or 0.0
     metric       = baseline_result.get("metric", "accuracy" if problem_type == "classification" else "r2")
     reason       = baseline_result.get("selection_reason", "")
-    candidates   = baseline_result.get("candidate_results", [])
-    cand_json    = json.dumps(candidates[:10], indent=2)
-
     stratify_arg = "stratify=y_full" if problem_type == "classification" else "stratify=None"
 
     if problem_type == "classification":
@@ -820,25 +1176,14 @@ candidates = [
 ]"""
 
     return [
-        _md(f"""\
-## 5. Baseline Model Benchmarking
-
-Quick evaluation of simple models to bound performance before tuning.
-
-**Agent baseline result:**
-- Best model: `{best_name}`
-- `{metric}` = `{best_score:.4f}`
-- Reasoning: {reason}
-"""),
+        _md("# 5. Baseline Model Benchmarking\n\n"
+            "Quick evaluation of simple models to establish a performance floor before tuning."),
         _code(f"""\
 # ── Train / validation split ──────────────────────────────────────
 X_train, X_val, y_train, y_val = train_test_split(
     X_full, y_full, test_size=0.20, random_state=RANDOM_STATE, {stratify_arg}
 )
 print(f"Train : {{X_train.shape}}   Val : {{X_val.shape}}")
-
-# Agent's candidate results for reference
-AGENT_BASELINE = {cand_json}
 """),
         _code(f"""\
 # ── Evaluate candidates ───────────────────────────────────────────
@@ -868,6 +1213,15 @@ ax.set_xlabel(SCORE_KEY.upper())
 ax.set_title(f"Baseline Model Comparison ({{SCORE_KEY.upper()}})", fontweight="bold", fontsize=13)
 plt.tight_layout(); plt.show()
 """),
+        _md(f"""\
+## Baseline Decision
+
+Agent pre-analysis selected **`{best_name}`** as the strongest simple model:
+- `{metric}` = `{best_score:.4f}`
+- Reasoning: {reason}
+
+Use the chart above to confirm or override this choice before moving to hyperparameter tuning.
+"""),
     ]
 
 
@@ -876,73 +1230,382 @@ def _section_hyperparameter_tuning(state: dict) -> list:
     advanced       = state.get("advanced_result", {})
     decision_log   = state.get("decision_log", {})
 
-    best_model_id   = advanced.get("model_id", "")
     best_model_name = advanced.get("model", "HistGradientBoostingClassifier")
     best_params     = advanced.get("best_hyperparameters", {})
     cv_score        = advanced.get("tuning_cv_score") or 0.0
     metric          = advanced.get("metric", "accuracy" if problem_type == "classification" else "r2")
-    cand_results    = advanced.get("candidate_results", [])
-    cand_json       = json.dumps(cand_results[:10], indent=2)
 
     tuning_strat    = decision_log.get("model_selection", {}).get("tuning_strategy", {})
     cv_folds        = tuning_strat.get("cv_folds", 5)
-    n_trials        = min(int(tuning_strat.get("optuna_trials_per_model", 30)), 50)
-
-    suggest_block = _optuna_suggest_block(best_model_id, problem_type)
+    n_trials        = min(int(tuning_strat.get("optuna_trials_per_model", 20)), 50)
 
     scoring = "f1_weighted" if metric == "f1_weighted" else ("accuracy" if problem_type == "classification" else "r2")
     cv_cls  = "StratifiedKFold" if problem_type == "classification" else "KFold"
 
-    best_params_json = json.dumps(best_params, indent=4)
+    is_cls = problem_type == "classification"
+
+    # ── Per-model builder function bodies (indented for notebook code) ──
+    if is_cls:
+        registry_code = """\
+def _build_hist_gbm(trial):
+    return HistGradientBoostingClassifier(
+        learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+        max_depth        = trial.suggest_categorical("max_depth", [None, 4, 6, 8, 12]),
+        max_leaf_nodes   = trial.suggest_int("max_leaf_nodes", 15, 127, step=8),
+        min_samples_leaf = trial.suggest_int("min_samples_leaf", 5, 50, step=5),
+        random_state=RANDOM_STATE,
+    )
+
+def _build_random_forest(trial):
+    return RandomForestClassifier(
+        n_estimators     = trial.suggest_int("n_estimators", 100, 500, step=50),
+        max_depth        = trial.suggest_categorical("max_depth", [None, 4, 6, 8, 12, 16]),
+        min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 10),
+        max_features     = trial.suggest_categorical("max_features", ["sqrt", "log2", None]),
+        random_state=RANDOM_STATE, n_jobs=-1,
+    )
+
+def _build_extra_trees(trial):
+    return ExtraTreesClassifier(
+        n_estimators     = trial.suggest_int("n_estimators", 100, 500, step=50),
+        max_depth        = trial.suggest_categorical("max_depth", [None, 4, 6, 8, 12, 16]),
+        min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 10),
+        max_features     = trial.suggest_categorical("max_features", ["sqrt", "log2", None]),
+        random_state=RANDOM_STATE, n_jobs=-1,
+    )
+
+def _build_gradient_boost(trial):
+    return GradientBoostingClassifier(
+        n_estimators  = trial.suggest_int("n_estimators", 50, 300, step=25),
+        learning_rate = trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+        max_depth     = trial.suggest_int("max_depth", 2, 6),
+        subsample     = trial.suggest_float("subsample", 0.6, 1.0),
+        random_state=RANDOM_STATE,
+    )
+
+def _build_adaboost(trial):
+    return AdaBoostClassifier(
+        n_estimators  = trial.suggest_int("n_estimators", 50, 300, step=25),
+        learning_rate = trial.suggest_float("learning_rate", 0.01, 2.0, log=True),
+        random_state=RANDOM_STATE,
+    )
+
+def _build_bagging(trial):
+    return BaggingClassifier(
+        n_estimators = trial.suggest_int("n_estimators", 10, 100, step=10),
+        max_samples  = trial.suggest_float("max_samples", 0.5, 1.0),
+        max_features = trial.suggest_float("max_features_frac", 0.5, 1.0),
+        random_state=RANDOM_STATE, n_jobs=-1,
+    )
+
+def _build_decision_tree(trial):
+    return DecisionTreeClassifier(
+        max_depth        = trial.suggest_categorical("max_depth", [None, 3, 5, 8, 12, 20]),
+        min_samples_split= trial.suggest_int("min_samples_split", 2, 20),
+        min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 10),
+        random_state=RANDOM_STATE,
+    )
+
+def _build_logistic(trial):
+    C = trial.suggest_float("C", 1e-3, 100.0, log=True)
+    return Pipeline([("scaler", StandardScaler()),
+                     ("model", LogisticRegression(C=C, max_iter=2000, random_state=RANDOM_STATE))])
+
+def _build_ridge_cls(trial):
+    alpha = trial.suggest_float("alpha", 1e-3, 100.0, log=True)
+    return Pipeline([("scaler", StandardScaler()),
+                     ("model", RidgeClassifier(alpha=alpha))])
+
+def _build_linear_svc(trial):
+    C = trial.suggest_float("C", 1e-3, 100.0, log=True)
+    return Pipeline([("scaler", StandardScaler()),
+                     ("model", LinearSVC(C=C, max_iter=5000, random_state=RANDOM_STATE))])
+
+def _build_svc_rbf(trial):
+    C     = trial.suggest_float("C", 1e-2, 100.0, log=True)
+    gamma = trial.suggest_categorical("gamma", ["scale", "auto"])
+    return Pipeline([("scaler", StandardScaler()),
+                     ("model", SVC(C=C, gamma=gamma, random_state=RANDOM_STATE))])
+
+def _build_knn(trial):
+    k      = trial.suggest_int("n_neighbors", 3, 30)
+    weight = trial.suggest_categorical("weights", ["uniform", "distance"])
+    return Pipeline([("scaler", StandardScaler()),
+                     ("model", KNeighborsClassifier(n_neighbors=k, weights=weight))])
+
+def _build_gaussian_nb(trial):
+    var_smoothing = trial.suggest_float("var_smoothing", 1e-10, 1e-5, log=True)
+    return GaussianNB(var_smoothing=var_smoothing)
+
+def _build_mlp(trial):
+    n_layers = trial.suggest_int("n_layers", 1, 3)
+    layer_sz = trial.suggest_categorical("layer_size", [64, 128, 256])
+    alpha    = trial.suggest_float("alpha", 1e-5, 1e-1, log=True)
+    return Pipeline([("scaler", StandardScaler()),
+                     ("model", MLPClassifier(
+                         hidden_layer_sizes=tuple([layer_sz] * n_layers),
+                         alpha=alpha, max_iter=500, random_state=RANDOM_STATE))])
+
+def _build_xgb(trial):
+    return XGBClassifier(
+        n_estimators       = trial.suggest_int("n_estimators", 100, 500, step=50),
+        learning_rate      = trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+        max_depth          = trial.suggest_int("max_depth", 2, 8),
+        subsample          = trial.suggest_float("subsample", 0.6, 1.0),
+        colsample_bytree   = trial.suggest_float("colsample_bytree", 0.5, 1.0),
+        random_state=RANDOM_STATE, eval_metric="logloss", verbosity=0,
+    )
+
+def _build_lgbm(trial):
+    return LGBMClassifier(
+        n_estimators  = trial.suggest_int("n_estimators", 100, 500, step=50),
+        learning_rate = trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+        num_leaves    = trial.suggest_int("num_leaves", 20, 150),
+        subsample     = trial.suggest_float("subsample", 0.6, 1.0),
+        random_state=RANDOM_STATE, verbosity=-1,
+    )
+
+MODEL_CANDIDATES = [
+    ("HistGradientBoosting", _build_hist_gbm),
+    ("RandomForest",         _build_random_forest),
+    ("ExtraTrees",           _build_extra_trees),
+    ("GradientBoosting",     _build_gradient_boost),
+    ("AdaBoost",             _build_adaboost),
+    ("BaggingClassifier",    _build_bagging),
+    ("DecisionTree",         _build_decision_tree),
+    ("LogisticRegression",   _build_logistic),
+    ("RidgeClassifier",      _build_ridge_cls),
+    ("LinearSVC",            _build_linear_svc),
+    ("SVC-RBF",              _build_svc_rbf),
+    ("KNN",                  _build_knn),
+    ("GaussianNB",           _build_gaussian_nb),
+    ("MLP",                  _build_mlp),
+]
+if HAS_XGB:
+    MODEL_CANDIDATES.append(("XGBoost",  _build_xgb))
+if HAS_LGBM:
+    MODEL_CANDIDATES.append(("LightGBM", _build_lgbm))"""
+    else:
+        registry_code = """\
+def _build_hist_gbm(trial):
+    return HistGradientBoostingRegressor(
+        learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+        max_depth        = trial.suggest_categorical("max_depth", [None, 4, 6, 8, 12]),
+        max_leaf_nodes   = trial.suggest_int("max_leaf_nodes", 15, 127, step=8),
+        min_samples_leaf = trial.suggest_int("min_samples_leaf", 5, 50, step=5),
+        random_state=RANDOM_STATE,
+    )
+
+def _build_random_forest(trial):
+    return RandomForestRegressor(
+        n_estimators     = trial.suggest_int("n_estimators", 100, 500, step=50),
+        max_depth        = trial.suggest_categorical("max_depth", [None, 4, 6, 8, 12, 16]),
+        min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 10),
+        max_features     = trial.suggest_categorical("max_features", ["sqrt", "log2", None]),
+        random_state=RANDOM_STATE, n_jobs=-1,
+    )
+
+def _build_extra_trees(trial):
+    return ExtraTreesRegressor(
+        n_estimators     = trial.suggest_int("n_estimators", 100, 500, step=50),
+        max_depth        = trial.suggest_categorical("max_depth", [None, 4, 6, 8, 12, 16]),
+        min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 10),
+        max_features     = trial.suggest_categorical("max_features", ["sqrt", "log2", None]),
+        random_state=RANDOM_STATE, n_jobs=-1,
+    )
+
+def _build_gradient_boost(trial):
+    return GradientBoostingRegressor(
+        n_estimators  = trial.suggest_int("n_estimators", 50, 300, step=25),
+        learning_rate = trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+        max_depth     = trial.suggest_int("max_depth", 2, 6),
+        subsample     = trial.suggest_float("subsample", 0.6, 1.0),
+        random_state=RANDOM_STATE,
+    )
+
+def _build_adaboost(trial):
+    return AdaBoostRegressor(
+        n_estimators  = trial.suggest_int("n_estimators", 50, 300, step=25),
+        learning_rate = trial.suggest_float("learning_rate", 0.01, 2.0, log=True),
+        random_state=RANDOM_STATE,
+    )
+
+def _build_bagging(trial):
+    return BaggingRegressor(
+        n_estimators = trial.suggest_int("n_estimators", 10, 100, step=10),
+        max_samples  = trial.suggest_float("max_samples", 0.5, 1.0),
+        random_state=RANDOM_STATE, n_jobs=-1,
+    )
+
+def _build_decision_tree(trial):
+    return DecisionTreeRegressor(
+        max_depth        = trial.suggest_categorical("max_depth", [None, 3, 5, 8, 12, 20]),
+        min_samples_split= trial.suggest_int("min_samples_split", 2, 20),
+        min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 10),
+        random_state=RANDOM_STATE,
+    )
+
+def _build_linear(trial):
+    alpha = trial.suggest_float("alpha", 1e-4, 100.0, log=True)
+    return Pipeline([("scaler", StandardScaler()),
+                     ("model", Ridge(alpha=alpha, random_state=RANDOM_STATE))])
+
+def _build_lasso(trial):
+    alpha = trial.suggest_float("alpha", 1e-4, 10.0, log=True)
+    return Pipeline([("scaler", StandardScaler()),
+                     ("model", Lasso(alpha=alpha, max_iter=5000, random_state=RANDOM_STATE))])
+
+def _build_elasticnet(trial):
+    alpha   = trial.suggest_float("alpha", 1e-4, 10.0, log=True)
+    l1_ratio= trial.suggest_float("l1_ratio", 0.1, 0.9)
+    return Pipeline([("scaler", StandardScaler()),
+                     ("model", ElasticNet(alpha=alpha, l1_ratio=l1_ratio, max_iter=5000, random_state=RANDOM_STATE))])
+
+def _build_svr_rbf(trial):
+    C   = trial.suggest_float("C", 1e-2, 100.0, log=True)
+    eps = trial.suggest_float("epsilon", 0.01, 1.0)
+    return Pipeline([("scaler", StandardScaler()),
+                     ("model", SVR(C=C, epsilon=eps))])
+
+def _build_knn(trial):
+    k      = trial.suggest_int("n_neighbors", 3, 30)
+    weight = trial.suggest_categorical("weights", ["uniform", "distance"])
+    return Pipeline([("scaler", StandardScaler()),
+                     ("model", KNeighborsRegressor(n_neighbors=k, weights=weight))])
+
+def _build_mlp(trial):
+    n_layers = trial.suggest_int("n_layers", 1, 3)
+    layer_sz = trial.suggest_categorical("layer_size", [64, 128, 256])
+    alpha    = trial.suggest_float("alpha", 1e-5, 1e-1, log=True)
+    return Pipeline([("scaler", StandardScaler()),
+                     ("model", MLPRegressor(
+                         hidden_layer_sizes=tuple([layer_sz] * n_layers),
+                         alpha=alpha, max_iter=500, random_state=RANDOM_STATE))])
+
+def _build_xgb(trial):
+    return XGBRegressor(
+        n_estimators     = trial.suggest_int("n_estimators", 100, 500, step=50),
+        learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+        max_depth        = trial.suggest_int("max_depth", 2, 8),
+        subsample        = trial.suggest_float("subsample", 0.6, 1.0),
+        colsample_bytree = trial.suggest_float("colsample_bytree", 0.5, 1.0),
+        random_state=RANDOM_STATE, verbosity=0,
+    )
+
+def _build_lgbm(trial):
+    return LGBMRegressor(
+        n_estimators  = trial.suggest_int("n_estimators", 100, 500, step=50),
+        learning_rate = trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+        num_leaves    = trial.suggest_int("num_leaves", 20, 150),
+        subsample     = trial.suggest_float("subsample", 0.6, 1.0),
+        random_state=RANDOM_STATE, verbosity=-1,
+    )
+
+MODEL_CANDIDATES = [
+    ("HistGradientBoosting", _build_hist_gbm),
+    ("RandomForest",         _build_random_forest),
+    ("ExtraTrees",           _build_extra_trees),
+    ("GradientBoosting",     _build_gradient_boost),
+    ("AdaBoost",             _build_adaboost),
+    ("BaggingRegressor",     _build_bagging),
+    ("DecisionTree",         _build_decision_tree),
+    ("Ridge",                _build_linear),
+    ("Lasso",                _build_lasso),
+    ("ElasticNet",           _build_elasticnet),
+    ("SVR-RBF",              _build_svr_rbf),
+    ("KNN",                  _build_knn),
+    ("MLP",                  _build_mlp),
+]
+if HAS_XGB:
+    MODEL_CANDIDATES.append(("XGBoost",  _build_xgb))
+if HAS_LGBM:
+    MODEL_CANDIDATES.append(("LightGBM", _build_lgbm))"""
 
     return [
-        _md(f"""\
-## 6. Hyperparameter Tuning
-
-Bayesian optimisation with Optuna (TPE sampler) over the most promising model families.
-
-**Agent best result:**
-- Model: `{best_model_name}`
-- CV `{metric}` = `{cv_score:.4f}`
-- Best params: `{json.dumps(best_params)}`
-"""),
+        _md("# 6. Hyperparameter Tuning\n\n"
+            "Bayesian optimisation with Optuna (TPE sampler) over **all** candidate model families. "
+            "Each model gets its own study. Compare results at the end and pick the best."),
         _code(f"""\
-# ── Agent tuning results (reference) ─────────────────────────────
-AGENT_TUNED   = {cand_json}
-AGENT_BEST_PARAMS = {best_params_json}
-
-print("Agent best model  :", {repr(best_model_name)})
-print("Agent best params :", AGENT_BEST_PARAMS)
-print(f"Agent CV {metric}    : {cv_score:.4f}")
-
-# ── Run Optuna study (or skip and use AGENT_BEST_PARAMS) ──────────
-N_TRIALS  = {n_trials}
+# ── Tuning configuration ─────────────────────────────────────────
+SCORING   = {repr(scoring)}   # metric to maximise
+N_TRIALS  = {n_trials}        # trials per model — increase for better results
 CV_FOLDS  = {cv_folds}
 cv_split  = {cv_cls}(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
 
-def optuna_objective(trial):
-{suggest_block}
-    scores = cross_val_score(
-        model, X_train, y_train,
-        cv=cv_split, scoring={repr(scoring)}, n_jobs=-1,
-    )
-    return float(scores.mean())
+# ── Helper: wrap a builder function into an Optuna objective ──────
+def make_objective(build_fn):
+    def objective(trial):
+        model  = build_fn(trial)
+        scores = cross_val_score(model, X_train, y_train,
+                                 cv=cv_split, scoring=SCORING, n_jobs=-1,
+                                 error_score="raise")
+        return float(scores.mean())
+    return objective
+
+# ── All model builder functions + candidate list ──────────────────
+{registry_code}
+"""),
+        _code(f"""\
+# ── Run one Optuna study per model ───────────────────────────────
+tuning_results = []
 
 if HAS_OPTUNA:
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE),
-    )
-    study.optimize(optuna_objective, n_trials=N_TRIALS, show_progress_bar=True)
+    for model_name, build_fn in MODEL_CANDIDATES:
+        print(f"  Tuning {{model_name:<28}} ({{N_TRIALS}} trials) ...", end=" ", flush=True)
+        try:
+            study = optuna.create_study(
+                study_name=model_name,
+                direction="maximize",
+                sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE),
+            )
+            study.optimize(make_objective(build_fn), n_trials=N_TRIALS,
+                           show_progress_bar=False)
+            tuning_results.append({{
+                "model":       model_name,
+                "best_score":  round(study.best_value, 4),
+                "n_trials":    len(study.trials),
+                "best_params": study.best_params,
+            }})
+            print(f"{{SCORING}} = {{study.best_value:.4f}}")
+        except Exception as exc:
+            print(f"FAILED — {{exc}}")
 
-    print(f"\\nOptuna best {scoring}: {{study.best_value:.4f}}")
-    print(f"Optuna best params : {{study.best_params}}")
-    BEST_PARAMS = {{**AGENT_BEST_PARAMS, **study.best_params}}
+    print(f"\\nTuning complete. {{len(tuning_results)}} models evaluated.")
 else:
-    print("Optuna not available — using agent's pre-tuned parameters.")
-    BEST_PARAMS = AGENT_BEST_PARAMS
+    print("Optuna not available — install with: pip install optuna")
+    tuning_results = []
+"""),
+        _code(f"""\
+# ── Compare all models ────────────────────────────────────────────
+if tuning_results:
+    tuning_df = pd.DataFrame(tuning_results).sort_values("best_score", ascending=False).reset_index(drop=True)
+    display(tuning_df[["model", "best_score", "n_trials"]])
 
-print(f"\\nFinal hyperparameters: {{BEST_PARAMS}}")
+    fig, ax = plt.subplots(figsize=(12, max(5, len(tuning_df) * 0.5)))
+    colors = ["#22c55e" if i == 0 else "#6366f1" for i in range(len(tuning_df))]
+    ax.barh(tuning_df["model"], tuning_df["best_score"], color=colors)
+    ax.set_xlabel(SCORING.upper())
+    ax.set_title(f"Hyperparameter Tuning — All Models ({{SCORING.upper()}})", fontsize=13, fontweight="bold")
+    ax.axvline(tuning_df["best_score"].max(), color="green", ls="--", alpha=0.5, label="Best")
+    ax.legend(); plt.tight_layout(); plt.show()
+
+    BEST_MODEL_NAME = tuning_df.iloc[0]["model"]
+    BEST_PARAMS     = tuning_df.iloc[0]["best_params"]
+    print(f"\\nBest model : {{BEST_MODEL_NAME}}")
+    print(f"Best {{SCORING}}: {{tuning_df.iloc[0]['best_score']:.4f}}")
+    print(f"Best params: {{BEST_PARAMS}}")
+else:
+    BEST_PARAMS = {}
+    print("No tuning results — install optuna: pip install optuna")
+"""),
+        _md(f"""\
+## Best Model Decision
+
+Agent pre-analysis selected **`{best_model_name}`** (CV `{metric}` = `{cv_score:.4f}`).
+
+After running your own multi-model tuning above, `BEST_MODEL_NAME` and `BEST_PARAMS` are set
+to whichever model topped the comparison chart. Update them manually if you prefer a different
+model (e.g. for interpretability or inference speed).
 """),
     ]
 
@@ -973,7 +1636,7 @@ def _section_best_model(state: dict) -> list:
 
     return [
         _md(f"""\
-## 7. Best Model — Full Evaluation
+# 7. Best Model — Full Evaluation
 
 | | |
 |---|---|
@@ -1086,7 +1749,7 @@ def _section_test_pipeline(state: dict) -> list:
     )
 
     return [
-        _md("## 8. Test Data Pipeline & Final Predictions\n\n"
+        _md("# 8. Test Data Pipeline & Final Predictions\n\n"
             "Retrain on the **full** training set, apply the same preprocessing to test data, "
             "and generate predictions."),
         _code(f"""\
@@ -1162,7 +1825,7 @@ def _section_results(state: dict) -> list:
 
     return [
         _md(f"""\
-## 9. Results & Next Steps
+# 9. Results & Next Steps
 
 | | |
 |---|---|
@@ -1171,10 +1834,10 @@ def _section_results(state: dict) -> list:
 | **Baseline score** | `{base_score:.4f}` |
 | **Improvement over baseline** | `{gain:+.4f}` |
 
-### Suggestions for further improvement
+## Suggestions for Further Improvement
 
 - **Feature engineering**: polynomial interactions, domain-specific features
-- **Ensemble / stacking**: blend top-3 models
+- **Ensemble / stacking**: blend top-3 models from the tuning comparison
 - **Cross-validation**: use full CV (5-fold) for final score estimates
 - **Calibration** (classification): `CalibratedClassifierCV` for probability outputs
 - **Domain knowledge**: add external data sources
@@ -1218,7 +1881,7 @@ def notebook_agent(state: dict) -> dict:
     cells: list = []
     cells += _section_title(state)
     cells += _section_mlflow_info(state)
-    cells += _section_setup()
+    cells += _section_setup(state)
     cells += _section_data_loading(state)
     cells += _section_eda(state)
     cells += _section_statistical_analysis(state)

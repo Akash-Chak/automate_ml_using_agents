@@ -8,6 +8,8 @@ from scipy.stats import (
     mannwhitneyu, pointbiserialr, spearmanr, pearsonr,
     levene, shapiro, ttest_ind,
 )
+from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
+from sklearn.preprocessing import OrdinalEncoder
 from itertools import combinations
 import warnings
 
@@ -399,30 +401,142 @@ def _bh_correction(test_details: dict) -> dict:
 
 
 # ─────────────────────────────────────────────
+# Mutual Information
+# ─────────────────────────────────────────────
+
+def _mutual_information(df: pd.DataFrame, feature_cols: list,
+                        target: str, problem_type: str) -> dict:
+    """
+    Compute mutual information between every feature and the target.
+    Model-free, captures non-linear relationships, works for both
+    classification and regression.
+    Returns {col: mi_score}.
+    """
+    target_series = df[target]
+    X_parts, col_order, discrete_mask = [], [], []
+
+    for col in feature_cols:
+        s = df[col].copy()
+        is_cat = s.dtype == object or str(s.dtype) == "category"
+        if is_cat:
+            enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+            s = enc.fit_transform(s.values.reshape(-1, 1)).ravel()
+            discrete_mask.append(True)
+        else:
+            s = s.fillna(s.median()).values
+            discrete_mask.append(False)
+        X_parts.append(s)
+        col_order.append(col)
+
+    if not X_parts:
+        return {}
+
+    X = np.column_stack(X_parts)
+    y = target_series.fillna(target_series.mode()[0]).values
+
+    fn = mutual_info_classif if problem_type == "classification" else mutual_info_regression
+    try:
+        scores = fn(X, y, discrete_features=discrete_mask, random_state=42)
+    except Exception:
+        return {}
+
+    return {col: round(float(s), 4) for col, s in zip(col_order, scores)}
+
+
+def _fe_signals(test_details: dict, mi_scores: dict,
+                df: pd.DataFrame, target: str, alpha: float) -> dict:
+    """
+    Synthesise statistical test results + mutual information into
+    actionable feature engineering signals.
+
+    nonlinear_candidates  — high MI but low Pearson/effect (non-linear structure)
+    target_encoding_candidates — categorical + high MI
+    high_mi_features      — MI > 0.05
+    low_mi_insignificant  — MI < 0.01 AND not significant → safe to drop
+    strong_linear_features — large effect size AND high MI
+    """
+    nonlinear_candidates       = []
+    target_encoding_candidates = []
+    high_mi                    = []
+    low_mi_insig               = []
+    strong_linear              = []
+
+    for col, mi in mi_scores.items():
+        detail     = test_details.get(col, {})
+        p_val      = detail.get("p_value", 1.0)
+        effect     = detail.get("effect_size", 0.0)
+        effect_lbl = detail.get("effect_label", "negligible")
+        test_name  = detail.get("test", "")
+        is_cat     = df[col].dtype == object or str(df[col].dtype) == "category"
+        is_pearson = test_name in ("pearson", "spearman")
+
+        if mi > 0.05:
+            high_mi.append(col)
+
+        if mi < 0.01 and p_val > alpha:
+            low_mi_insig.append(col)
+
+        # Non-linear: MI says it's informative but linear/rank tests disagree
+        if mi > 0.05 and is_pearson and abs(detail.get("statistic", 0)) < 0.2:
+            nonlinear_candidates.append(col)
+        elif mi > 0.05 and not is_pearson and effect_lbl in ("negligible", "small"):
+            nonlinear_candidates.append(col)
+
+        if is_cat and mi > 0.05:
+            target_encoding_candidates.append(col)
+
+        if effect_lbl == "large" and mi > 0.1:
+            strong_linear.append(col)
+
+    return {
+        "high_mi_features":           high_mi,
+        "low_mi_insignificant":        low_mi_insig,
+        "nonlinear_candidates":        nonlinear_candidates,
+        "strong_linear_features":      strong_linear,
+        "target_encoding_candidates":  target_encoding_candidates,
+    }
+
+
+# ─────────────────────────────────────────────
 # Feature Ranking
 # ─────────────────────────────────────────────
 
-def _rank_features(test_details: dict) -> list:
+def _rank_features(test_details: dict, mi_scores: dict = None) -> list:
     """
-    Rank features by: (1) significance after FDR, (2) effect size descending.
+    Rank features by: (1) significance after FDR,
+                      (2) max(effect_size, normalised MI) descending.
+    MI captures non-linear relationships that statistical tests miss.
     Returns ordered list of dicts.
     """
+    mi = mi_scores or {}
+
+    # Normalise MI scores to [0, 1] for fair comparison with effect sizes
+    max_mi = max(mi.values()) if mi else 1.0
+    if max_mi == 0:
+        max_mi = 1.0
+
     rows = []
     for col, d in test_details.items():
         if "skipped" in d:
             continue
+        effect = d.get("effect_size", 0.0)
+        mi_norm = mi.get(col, 0.0) / max_mi
+        combined_score = max(effect, mi_norm)
+
         rows.append({
-            "feature":      col,
-            "test":         d.get("test", "—"),
-            "p_value":      d.get("p_value", 1.0),
-            "p_adjusted":   d.get("p_adjusted", 1.0),
-            "effect_size":  d.get("effect_size", 0.0),
-            "effect_label": d.get("effect_label", "—"),
-            "significant":  d.get("p_value", 1.0) < ALPHA,
+            "feature":               col,
+            "test":                  d.get("test", "—"),
+            "p_value":               d.get("p_value", 1.0),
+            "p_adjusted":            d.get("p_adjusted", 1.0),
+            "effect_size":           effect,
+            "effect_label":          d.get("effect_label", "—"),
+            "mi_score":              mi.get(col, None),
+            "combined_score":        round(combined_score, 4),
+            "significant":           d.get("p_value", 1.0) < ALPHA,
             "significant_after_fdr": d.get("significant_after_fdr", False),
         })
 
-    rows.sort(key=lambda x: (-int(x["significant_after_fdr"]), -x["effect_size"]))
+    rows.sort(key=lambda x: (-int(x["significant_after_fdr"]), -x["combined_score"]))
     return rows
 
 
@@ -496,8 +610,11 @@ def stats_agent(state: dict) -> dict:
     # ── FDR Correction ────────────────────────
     test_details = _bh_correction(test_details)
 
-    # ── Feature ranking ───────────────────────
-    ranked_features = _rank_features(test_details)
+    # ── Mutual Information ────────────────────
+    mi_scores = _mutual_information(df, feature_cols, target, problem_type)
+
+    # ── Feature ranking (incorporates MI) ─────
+    ranked_features = _rank_features(test_details, mi_scores)
 
     # ── Significance buckets ──────────────────
     significant         = [r["feature"] for r in ranked_features if r["significant"]]
@@ -512,6 +629,9 @@ def stats_agent(state: dict) -> dict:
     # ── Multicollinearity ─────────────────────
     intercorr_flags = _feature_intercorrelation(df, feature_cols)
 
+    # ── Feature Engineering Signals ───────────
+    fe_signals = _fe_signals(test_details, mi_scores, df, target, ALPHA)
+
     # ── Warnings ─────────────────────────────
     warnings_list = []
     if len(significant) == 0:
@@ -519,6 +639,11 @@ def stats_agent(state: dict) -> dict:
     if len(significant) - len(significant_fdr) > 3:
         warnings_list.append(
             f"⚠️ {len(significant) - len(significant_fdr)} features lose significance after FDR correction — potential false positives."
+        )
+    if fe_signals["nonlinear_candidates"]:
+        warnings_list.append(
+            f"ℹ️ Non-linear candidates detected (high MI, low linear correlation): "
+            f"{', '.join(fe_signals['nonlinear_candidates'])} — consider polynomial or tree-based transforms."
         )
     for col, d in test_details.items():
         if d.get("expected_freq_assumption_ok") is False:
@@ -538,13 +663,19 @@ def stats_agent(state: dict) -> dict:
         **state,
         "stats_report": {
             # Core results
-            "significant":          significant,
+            "significant":           significant,
             "significant_after_fdr": significant_fdr,
-            "insignificant":        insignificant,
-            "skipped":              skipped,
+            "insignificant":         insignificant,
+            "skipped":               skipped,
 
-            # Ranked feature table
-            "ranked_features":      ranked_features,
+            # Ranked feature table (includes mi_score + combined_score)
+            "ranked_features":       ranked_features,
+
+            # Mutual information scores (raw)
+            "mi_scores":             mi_scores,
+
+            # Feature engineering signals
+            "fe_signals":            fe_signals,
 
             # Effect size buckets
             "large_effect_features":  large_effect,
@@ -552,16 +683,16 @@ def stats_agent(state: dict) -> dict:
             "small_effect_features":  small_effect,
 
             # Per-feature test details
-            "details":              test_details,
+            "details":               test_details,
 
             # Multicollinearity
             "multicollinearity_flags": intercorr_flags,
 
             # Meta
-            "alpha":                ALPHA,
-            "n_features_tested":    len(test_details),
-            "n_features_skipped":   len(skipped),
-            "problem_type":         problem_type,
-            "warnings":             warnings_list,
+            "alpha":                 ALPHA,
+            "n_features_tested":     len(test_details),
+            "n_features_skipped":    len(skipped),
+            "problem_type":          problem_type,
+            "warnings":              warnings_list,
         }
     }

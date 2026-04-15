@@ -3,6 +3,8 @@
 import pandas as pd
 import numpy as np
 import os
+import matplotlib
+matplotlib.use("Agg")   # non-interactive backend — safe to call from any thread
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import seaborn as sns
@@ -167,7 +169,10 @@ def _correlation_analysis(df: pd.DataFrame, target: str,
     # Full heatmap
     fig, ax = plt.subplots(figsize=(max(8, len(num_df.columns)), max(6, len(num_df.columns) - 1)))
     mask = np.triu(np.ones_like(corr, dtype=bool))
-    sns.heatmap(corr, mask=mask, annot=True, fmt=".2f", cmap="coolwarm",
+    # Disable annotations on large matrices — rendering thousands of text
+    # cells is the single biggest heatmap bottleneck.
+    annot = len(num_df.columns) <= 20
+    sns.heatmap(corr, mask=mask, annot=annot, fmt=".2f", cmap="coolwarm",
                 center=0, linewidths=0.5, ax=ax, annot_kws={"size": 8})
     ax.set_title("Feature Correlation Heatmap (lower triangle)", fontsize=12)
     _save(fig, "correlation_heatmap.png", plots)
@@ -268,6 +273,20 @@ def _target_analysis(df: pd.DataFrame, target: str,
     _save(fig, f"target_{target}_distribution.png", plots)
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+_PLOT_SAMPLE = 3_000   # max rows used for any single plot (keeps render fast)
+
+
+def _plot_sample(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a random sample capped at _PLOT_SAMPLE rows for rendering.
+    Stats (mean, std, skew …) are always computed on the full dataframe.
+    """
+    if len(df) <= _PLOT_SAMPLE:
+        return df
+    return df.sample(_PLOT_SAMPLE, random_state=42)
+
+
 # ── Main agent ────────────────────────────────────────────────────────────────
 
 def eda_agent(state: dict) -> dict:
@@ -287,28 +306,31 @@ def eda_agent(state: dict) -> dict:
 
     os.makedirs(PLOT_DIR, exist_ok=True)
 
-    # 1. Target distribution
-    _target_analysis(df, target, problem_type, plots, insights)
+    # Sampled dataframe used for all plots — stats still use the full df
+    df_plot = _plot_sample(df)
 
-    # 2. Missing value overview
+    # 1. Target distribution
+    _target_analysis(df_plot, target, problem_type, plots, insights)
+
+    # 2. Missing value overview (stats on full df, plot on sample)
     missing_summary = _missing_value_analysis(df, plots, insights)
 
-    # 3. Per-feature analysis
+    # 3. Per-feature analysis — every feature, plots sampled for render speed
     for col in df.columns:
         if col == target:
             continue
         try:
             if pd.api.types.is_numeric_dtype(df[col]):
                 feature_summary[col] = _analyse_numerical(
-                    df, col, target, problem_type, plots, insights)
+                    df_plot, col, target, problem_type, plots, insights)
             else:
                 feature_summary[col] = _analyse_categorical(
-                    df, col, target, problem_type, plots, insights)
+                    df_plot, col, target, problem_type, plots, insights)
         except Exception as e:
             insights.append(f"❌ Could not analyse '{col}': {e}")
 
-    # 4. Correlation analysis
-    corr_summary = _correlation_analysis(df, target, plots, insights)
+    # 4. Correlation analysis (sampled for large datasets)
+    corr_summary = _correlation_analysis(df_plot, target, plots, insights)
 
     return {
         **state,

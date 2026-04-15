@@ -1,10 +1,13 @@
-streamlit>=1.35
+nicegui>=1.4
 langgraph>=0.1
 langchain-openai
+langchain-anthropic
 openai
+anthropic
 pandas
 numpy
 scikit-learn
+scipy
 optuna
 nbformat
 python-dotenv

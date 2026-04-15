@@ -17,12 +17,6 @@ from sklearn.model_selection import train_test_split
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 
 from utils.data_utils import ensure_processed_data
-from utils.mlflow_utils import (
-    MLFLOW_AVAILABLE,
-    get_experiment_url,
-    log_baseline_run,
-    setup_mlflow_experiment,
-)
 
 
 def _safe_float(value):
@@ -305,7 +299,6 @@ def baseline_model_agent(state):
             "imbalance_comparison": imbalance_comparison,
             "candidate_results": candidate_results,
         }
-        _log_baseline_to_mlflow(state)
         return state
 
     context = _regression_context(state, X)
@@ -348,20 +341,4 @@ def baseline_model_agent(state):
         "model_reason": best_note,
         "candidate_results": candidate_results,
     }
-    _log_baseline_to_mlflow(state)
     return state
-
-
-def _log_baseline_to_mlflow(state: dict) -> None:
-    """Log the baseline result to MLflow if configured."""
-    exp_name     = state.get("mlflow_experiment_name", "")
-    tracking_uri = state.get("mlflow_tracking_uri", "./mlruns")
-    if not MLFLOW_AVAILABLE or not exp_name:
-        return
-    try:
-        setup_mlflow_experiment(tracking_uri, exp_name)
-        run_id = log_baseline_run(exp_name, state, state["baseline_result"])
-        state["mlflow_baseline_run_id"] = run_id
-        state["mlflow_experiment_url"]  = get_experiment_url(tracking_uri, exp_name)
-    except Exception:
-        pass

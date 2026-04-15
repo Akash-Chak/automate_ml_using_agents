@@ -1,0 +1,107 @@
+/*
+ * nicegui_app/static/styles.css
+ *
+ * ╔══════════════════════════════════════════════════════════════════════════╗
+ * ║                   PAGE-LEVEL CSS — EDIT HERE                           ║
+ * ╚══════════════════════════════════════════════════════════════════════════╝
+ *
+ * Loaded at startup via ui.add_head_html() in main.py.
+ * Colour tokens match the values in theme.py — keep them in sync.
+ *
+ * Sections
+ *   1. Reset / base
+ *   2. Scrollbar styling
+ *   3. Running-node pulse animation
+ *   4. Status-feed heartbeat fade
+ *   5. Header & drawer overrides
+ *   6. Button overrides
+ */
+
+/* ── 1. Reset / base ──────────────────────────────────────────────────────── */
+
+body, html {
+    background: #060b14;          /* PAGE_BG  — matches theme.py  */
+    color: #e2e8f0;
+    font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+}
+
+/* ── 2. Scrollbar styling ─────────────────────────────────────────────────── */
+
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+::-webkit-scrollbar-track {
+    background: #0d1117;          /* CARD_BG */
+}
+::-webkit-scrollbar-thumb {
+    background: #1e2535;          /* CARD_BORDER */
+    border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: #334155;
+}
+
+/* ── 3. Running-node pulse animation ─────────────────────────────────────── */
+/*
+ * ECharts shadowBlur handles the amber glow on the running node.
+ * This CSS keyframe adds a gentle opacity pulse to the entire chart
+ * while any node is in the "running" state.  Applied via JS class toggle
+ * if needed, or left as a utility class.
+ */
+
+@keyframes pulse-amber {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.75; }
+}
+.node-running-pulse {
+    animation: pulse-amber 1.4s ease-in-out infinite;
+}
+
+/* ── 4. Status-feed heartbeat fade ───────────────────────────────────────── */
+/*
+ * The "Running… (Xs elapsed)" heartbeat line fades in each update.
+ * NiceGUI adds/replaces the element; this gives a subtle visual tick.
+ */
+
+@keyframes fade-in {
+    from { opacity: 0.4; }
+    to   { opacity: 1; }
+}
+.heartbeat-tick {
+    animation: fade-in 0.35s ease-out;
+}
+
+/* ── 5. Header & drawer overrides ────────────────────────────────────────── */
+
+/* Remove Quasar's default header shadow so our border-bottom shows cleanly */
+.q-header {
+    box-shadow: none !important;
+}
+
+/* Ensure the left drawer doesn't show a Quasar shadow */
+.q-drawer {
+    box-shadow: none !important;
+}
+
+/* ── 6. Button overrides ─────────────────────────────────────────────────── */
+
+/* Run button — blue fill */
+.btn-run {
+    background: #1d4ed8 !important;
+    color: #fff !important;
+    border-radius: 8px !important;
+}
+.btn-run:hover {
+    background: #1e40af !important;
+}
+
+/* Flat action buttons (Stop, Clear, Load columns) */
+.btn-flat-action {
+    border-radius: 8px !important;
+    color: #94a3b8 !important;
+}
+.btn-flat-action:hover {
+    color: #e2e8f0 !important;
+    background: #1e2535 !important;
+}
