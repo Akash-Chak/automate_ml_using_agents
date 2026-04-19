@@ -178,11 +178,21 @@ def build_preprocessed_dataset(state):
 
     steps         = []
     dropped_cols  = []
+    deferred_drops = []   # interaction source columns deferred until after section 5
     engineered    = []
     transformed   = []
     encoded_cols  = {"frequency": [], "one_hot": [], "target_encode": []}
     imputation    = {"numeric_median": [], "categorical_mode": []}
     fe_steps      = []    # detailed log of every FE step applied
+
+    # Columns that are sources for LLM interaction features must survive until
+    # after interactions are created, so collect them upfront.
+    interaction_sources = {
+        col
+        for spec in llm_interactions
+        for col in (spec.get("col_a"), spec.get("col_b"))
+        if col
+    }
 
     # ─────────────────────────────────────────────────────────────────────────
     # 1. Drop clearly bad columns
@@ -201,15 +211,25 @@ def build_preprocessed_dataset(state):
         llm_action = llm_fe.get(col, {}).get("action")
 
         if llm_action == "drop" or col in llm_drop:
-            dropped_cols.append(col)
-            fe_steps.append({"col": col, "action": "drop", "method": None,
-                              "reason": llm_fe.get(col, {}).get("reason", "LLM-recommended drop")})
-        elif col in drop_candidates:
-            dropped_cols.append(col)
-        elif missing_pct >= 80:
-            dropped_cols.append(col)
-        elif col in high_missing_cands and not has_signal:
-            dropped_cols.append(col)
+            if col in interaction_sources:
+                deferred_drops.append(col)   # keep alive until interactions are done
+            else:
+                dropped_cols.append(col)
+                fe_steps.append({"col": col, "action": "drop", "method": None,
+                                  "reason": llm_fe.get(col, {}).get("reason", "LLM-recommended drop")})
+        elif col not in interaction_sources:
+            if col in drop_candidates and col not in significant_fdr and col not in medium_or_large:
+                dropped_cols.append(col)
+                fe_steps.append({"col": col, "action": "drop", "method": None,
+                                  "reason": "profiling: constant/id/irrelevant column"})
+            elif missing_pct >= 80:
+                dropped_cols.append(col)
+                fe_steps.append({"col": col, "action": "drop", "method": None,
+                                  "reason": f"data quality: {missing_pct:.0f}% missing values"})
+            elif col in high_missing_cands and not has_signal:
+                dropped_cols.append(col)
+                fe_steps.append({"col": col, "action": "drop", "method": None,
+                                  "reason": "high missing % and no statistical signal"})
 
     if dropped_cols:
         df = df.drop(columns=sorted(set(dropped_cols)), errors="ignore")
@@ -341,16 +361,40 @@ def build_preprocessed_dataset(state):
     # ─────────────────────────────────────────────────────────────────────────
     # 5. Interaction features (LLM-directed)
     # ─────────────────────────────────────────────────────────────────────────
+    _itype_sep = {"ratio": "_div_", "product": "_x_", "difference": "_minus_"}
+    interaction_output_names = {
+        f"{s['col_a']}{_itype_sep.get(s.get('type', 'ratio'), '_' + s.get('type', 'ratio') + '_')}{s['col_b']}"
+        for s in llm_interactions
+        if s.get("col_a") and s.get("col_b")
+    }
+
     for spec in llm_interactions:
         col_a = spec.get("col_a")
         col_b = spec.get("col_b")
         itype = spec.get("type", "ratio")
-        if col_a and col_b:
-            X = _apply_interaction(X, col_a, col_b, itype, fe_steps)
-            engineered.append(f"{col_a}_{itype}_{col_b}")
+        if not (col_a and col_b):
+            continue
+        sep = _itype_sep.get(itype, f"_{itype}_")
+        output_name = f"{col_a}{sep}{col_b}"
+        # If LLM contradicts itself by also asking to drop the interaction output, skip it
+        if output_name in llm_drop or llm_fe.get(output_name, {}).get("action") == "drop":
+            continue
+        X = _apply_interaction(X, col_a, col_b, itype, fe_steps)
+        engineered.append(output_name)
 
     if llm_interactions:
         steps.append("created_interaction_features")
+
+    # Drop interaction source columns that were deferred from section 1
+    if deferred_drops:
+        actual_deferred = [c for c in deferred_drops if c in X.columns]
+        if actual_deferred:
+            X = X.drop(columns=actual_deferred, errors="ignore")
+            dropped_cols.extend(actual_deferred)
+            for c in actual_deferred:
+                fe_steps.append({"col": c, "action": "drop", "method": None,
+                                  "reason": "deferred drop — kept alive for interaction feature creation"})
+        steps.append("dropped_interaction_source_columns")
 
     # ─────────────────────────────────────────────────────────────────────────
     # 6. Drop low-signal features
@@ -362,18 +406,25 @@ def build_preprocessed_dataset(state):
             corr_strength = target_corr.get(col, 0.0)
             effect_size   = stats_row.get("effect_size", 0.0)
             mi_score      = stats_row.get("mi_score") or 0.0
+            llm_col_action = llm_fe.get(col, {}).get("action")
             if (
-                col not in significant_fdr
+                llm_col_action not in ("transform", "encode", "keep")
+                and col not in significant_fdr
+                and col not in medium_or_large
+                and col not in interaction_sources
+                and col not in set(engineered)   # protects datetime-derived + interaction outputs
                 and corr_strength < 0.05
                 and effect_size < 0.1
                 and mi_score < 0.02
-                and col not in medium_or_large
             ):
                 drop_low.append(col)
 
         if drop_low:
             X = X.drop(columns=sorted(set(drop_low)), errors="ignore")
             dropped_cols.extend(drop_low)
+            for c in drop_low:
+                fe_steps.append({"col": c, "action": "drop", "method": None,
+                                  "reason": "low signal: not significant, low MI, low effect size, low target correlation"})
             steps.append("dropped_low_signal_features")
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -391,19 +442,28 @@ def build_preprocessed_dataset(state):
             float(stats_rank.get(fn, {}).get("effect_size", 0.0)),
         )
 
+    signal_cols = significant_fdr | medium_or_large
+
     for c1, c2, _ in corr_pairs:
         if c1 in X.columns and c2 in X.columns:
-            drop_collinear.add(c2 if feature_priority(c1) >= feature_priority(c2) else c1)
+            to_drop = c2 if feature_priority(c1) >= feature_priority(c2) else c1
+            if to_drop not in signal_cols:
+                drop_collinear.add(to_drop)
 
     for flag in stats_pairs:
         c1 = flag.get("col_a")
         c2 = flag.get("col_b")
         if c1 in X.columns and c2 in X.columns:
-            drop_collinear.add(c2 if feature_priority(c1) >= feature_priority(c2) else c1)
+            to_drop = c2 if feature_priority(c1) >= feature_priority(c2) else c1
+            if to_drop not in signal_cols:
+                drop_collinear.add(to_drop)
 
     if drop_collinear:
         X = X.drop(columns=sorted(drop_collinear), errors="ignore")
         dropped_cols.extend(sorted(drop_collinear))
+        for c in sorted(drop_collinear):
+            fe_steps.append({"col": c, "action": "drop", "method": None,
+                              "reason": "multicollinearity: lower-priority duplicate of a correlated feature"})
         steps.append("reduced_multicollinearity")
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -489,6 +549,8 @@ def build_preprocessed_dataset(state):
         "fe_steps_applied":      fe_steps,
         "llm_fe_used":           bool(llm_fe),
         "interactions_created":  len(llm_interactions),
+        "interaction_source_columns": sorted(interaction_sources),
+        "interaction_output_columns": sorted(interaction_output_names),
     }
 
     return processed_data, report

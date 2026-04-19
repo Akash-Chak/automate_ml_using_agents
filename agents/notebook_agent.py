@@ -42,6 +42,25 @@ def _parse_preprocessing(preprocessing_report: dict) -> dict:
     ohe_cols        = list(encoded.get("one_hot", []))
     te_cols         = list(encoded.get("target_encode", []))
 
+    # Columns that were kept alive to create interaction features, then dropped after.
+    # These must be dropped POST-interaction in the notebook, not upfront.
+    interaction_src  = set(preprocessing_report.get("interaction_source_columns", []))
+    interaction_out  = set(preprocessing_report.get("interaction_output_columns", []))
+    # Interaction output columns must never appear in any drop list
+    dropped          = [c for c in dropped if c not in interaction_out]
+    dropped_late     = [c for c in dropped if c in interaction_src]
+    dropped_early    = [c for c in dropped if c not in interaction_src]
+
+    # Remove from all transform/encode lists any column already scheduled for dropping
+    dropped_set     = set(dropped)
+    log_cols        = [c for c in log_cols        if c not in dropped_set]
+    yj_cols         = [c for c in yj_cols         if c not in dropped_set]
+    winsorized_cols = [c for c in winsorized_cols if c not in dropped_set]
+    binned_cols     = [c for c in binned_cols     if c not in dropped_set]
+    freq_cols       = [c for c in freq_cols       if c not in dropped_set]
+    ohe_cols        = [c for c in ohe_cols        if c not in dropped_set]
+    te_cols         = [c for c in te_cols         if c not in dropped_set]
+
     # Interaction features created
     interactions = [
         s for s in fe_steps if s.get("action") == "interaction"
@@ -52,7 +71,8 @@ def _parse_preprocessing(preprocessing_report: dict) -> dict:
     ]
 
     return {
-        "dropped":          dropped,
+        "dropped":          dropped_early,
+        "dropped_late":     dropped_late,
         "log_cols":         log_cols,
         "yj_cols":          yj_cols,
         "winsorized_cols":  winsorized_cols,
@@ -871,6 +891,7 @@ def _section_preprocessing(state: dict) -> list:
 
     cfg = _parse_preprocessing(preprocessing_report)
     dropped       = cfg["dropped"]
+    dropped_late  = cfg["dropped_late"]
     log_cols      = cfg["log_cols"]
     yj_cols       = cfg["yj_cols"]
     winsorized    = cfg["winsorized_cols"]
@@ -971,7 +992,8 @@ def _section_preprocessing(state: dict) -> list:
 # Preprocessing Configuration  (derived from agent analysis)
 # ═══════════════════════════════════════════════════════════════
 
-COLS_TO_DROP       = {repr(dropped)}
+COLS_TO_DROP                  = {repr(dropped)}
+INTERACTION_SOURCE_COLS_TO_DROP = {repr(dropped_late)}
 LOG_TRANSFORM_COLS = {repr(log_cols)}
 YJ_TRANSFORM_COLS  = {repr(yj_cols)}
 WINSORIZE_COLS     = {repr(winsorize_cols_all)}
@@ -1038,6 +1060,11 @@ def fit_preprocessor(df, target_col=TARGET):
             except Exception:
                 pass
 {interaction_code}
+    # Drop interaction source columns now that interactions are created
+    _drop_src = [c for c in INTERACTION_SOURCE_COLS_TO_DROP if c in X.columns]
+    if _drop_src:
+        X = X.drop(columns=_drop_src)
+
     # 6. Target encoding (if applicable — uses global mean on test set)
     TE_COLS = TARGET_ENCODE_COLS
     if y is not None and TE_COLS:
@@ -1066,6 +1093,13 @@ def fit_preprocessor(df, target_col=TARGET):
     ohe_present = [c for c in OHE_COLS if c in X.columns]
     if ohe_present:
         X = pd.get_dummies(X, columns=ohe_present, drop_first=True)
+
+    # Safety: convert remaining datetime cols to numeric, drop unhandled string cols
+    for c in X.select_dtypes(include=["datetime64", "datetimetz"]).columns.tolist():
+        X[c] = X[c].astype("int64").astype(float)
+    _residual_obj = X.select_dtypes(include=["object", "category"]).columns.tolist()
+    if _residual_obj:
+        X = X.drop(columns=_residual_obj)
 
     feature_names = X.columns.tolist()
 
@@ -1104,6 +1138,11 @@ def apply_preprocessor(df, transformers, target_col=TARGET):
     for c in LOG_TRANSFORM_COLS:
         if c in X.columns: X[c] = np.log1p(X[c].clip(lower=0))
 
+    # Drop interaction source columns (mirroring fit_preprocessor)
+    _drop_src = [c for c in INTERACTION_SOURCE_COLS_TO_DROP if c in X.columns]
+    if _drop_src:
+        X = X.drop(columns=_drop_src)
+
     for c, fm in transformers["freq_maps"].items():
         if c in X.columns:
             X[f"{{c}}_freq"] = X[c].map(fm).fillna(0.0)
@@ -1112,6 +1151,13 @@ def apply_preprocessor(df, transformers, target_col=TARGET):
     ohe_present = [c for c in OHE_COLS if c in X.columns]
     if ohe_present:
         X = pd.get_dummies(X, columns=ohe_present, drop_first=True)
+
+    # Safety: convert remaining datetime cols to numeric, drop unhandled string cols
+    for c in X.select_dtypes(include=["datetime64", "datetimetz"]).columns.tolist():
+        X[c] = X[c].astype("int64").astype(float)
+    _residual_obj = X.select_dtypes(include=["object", "category"]).columns.tolist()
+    if _residual_obj:
+        X = X.drop(columns=_residual_obj)
 
     X = X.reindex(columns=transformers["feature_names"], fill_value=0)
 
@@ -1134,6 +1180,9 @@ X_full.head()
 def _section_baseline_models(state: dict) -> list:
     problem_type    = state.get("problem_type", "classification")
     baseline_result = state.get("baseline_result", {})
+    mlflow_uri      = state.get("mlflow_tracking_uri", "./mlruns")
+    mlflow_exp      = state.get("mlflow_experiment_name", "ml_pipeline")
+    enable_hpo_mlflow = state.get("enable_hpo_mlflow", True)
 
     best_name    = baseline_result.get("model", "—")
     best_score   = baseline_result.get("score") or 0.0
@@ -1177,7 +1226,8 @@ candidates = [
 
     return [
         _md("# 5. Baseline Model Benchmarking\n\n"
-            "Quick evaluation of simple models to establish a performance floor before tuning."),
+            "Quick evaluation of simple models to establish a performance floor before tuning. "
+            "Every run is logged to MLflow automatically."),
         _code(f"""\
 # ── Train / validation split ──────────────────────────────────────
 X_train, X_val, y_train, y_val = train_test_split(
@@ -1186,24 +1236,70 @@ X_train, X_val, y_train, y_val = train_test_split(
 print(f"Train : {{X_train.shape}}   Val : {{X_val.shape}}")
 """),
         _code(f"""\
-# ── Evaluate candidates ───────────────────────────────────────────
+# ── MLflow configuration ──────────────────────────────────────────
+import mlflow
+import mlflow.sklearn
+
+MLFLOW_TRACKING_URI   = "{mlflow_uri}"
+MLFLOW_EXPERIMENT     = "{mlflow_exp}"
+# Set to True to log every Optuna trial as a nested MLflow run (section 6)
+ENABLE_HPO_MLFLOW     = {str(enable_hpo_mlflow)}
+
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+mlflow.set_experiment(MLFLOW_EXPERIMENT)
+print(f"MLflow tracking URI : {{MLFLOW_TRACKING_URI}}")
+print(f"Experiment          : {{MLFLOW_EXPERIMENT}}")
+print(f"HPO MLflow logging  : {{ENABLE_HPO_MLFLOW}}")
+"""),
+        _code(f"""\
+# ── Evaluate candidates & log to MLflow ──────────────────────────
 {score_fn}
 
 {baselines}
+
+feature_names = transformers["feature_names"]
 
 print("\\nTraining & evaluating baseline models …")
 results = []
 for name, model in candidates:
     try:
-        s = score_model(model, X_train, X_val, y_train, y_val)
-        results.append({{"model": name, **s}})
-        print(f"  {{name:<32}} {{SCORE_KEY}}={{s[SCORE_KEY]:.4f}}")
+        with mlflow.start_run(run_name=f"baseline_{{name}}") as run:
+            s = score_model(model, X_train, X_val, y_train, y_val)
+            mlflow.log_param("model_name", name)
+            mlflow.log_param("n_features", len(feature_names))
+            mlflow.log_param("features",   str(feature_names[:30]))
+            mlflow.log_param("train_size", len(X_train))
+            mlflow.log_param("val_size",   len(X_val))
+            mlflow.log_params({{f"metric_{{k}}": v for k, v in s.items()}})
+            mlflow.log_metrics(s)
+            try:
+                mlflow.sklearn.log_model(model, artifact_path="model")
+            except Exception:
+                pass
+            results.append({{"model": name, "run_id": run.info.run_id, **s}})
+            print(f"  {{name:<32}} {{SCORE_KEY}}={{s[SCORE_KEY]:.4f}}  run={{run.info.run_id[:8]}}")
     except Exception as exc:
         print(f"  {{name:<32}} FAILED: {{exc}}")
 
-res_df = pd.DataFrame(results).sort_values(SCORE_KEY, ascending=False)
-print("\\n=== Baseline Results ===")
+res_df = pd.DataFrame(results).sort_values(SCORE_KEY, ascending=False).reset_index(drop=True)
+print("\\n=== Baseline Results (from MLflow runs) ===")
 display(res_df)
+
+# Pull best baseline run back from MLflow
+_client = mlflow.tracking.MlflowClient()
+_exp    = mlflow.get_experiment_by_name(MLFLOW_EXPERIMENT)
+if _exp:
+    _runs = _client.search_runs(
+        experiment_ids=[_exp.experiment_id],
+        filter_string="tags.`mlflow.runName` LIKE 'baseline_%'",
+        order_by=[f"metrics.{{SCORE_KEY}} DESC"],
+        max_results=1,
+    )
+    if _runs:
+        _best = _runs[0]
+        print(f"\\nMLflow best baseline  : {{_best.data.tags.get('mlflow.runName', '?')}}")
+        print(f"  {{SCORE_KEY:<12}}: {{_best.data.metrics.get(SCORE_KEY, '?')}}")
+        print(f"  run_id       : {{_best.info.run_id}}")
 
 # Visualise
 fig, ax = plt.subplots(figsize=(10, max(4, len(res_df) * 0.5)))
@@ -1220,7 +1316,8 @@ Agent pre-analysis selected **`{best_name}`** as the strongest simple model:
 - `{metric}` = `{best_score:.4f}`
 - Reasoning: {reason}
 
-Use the chart above to confirm or override this choice before moving to hyperparameter tuning.
+All baseline runs are logged to MLflow. Use the chart above (or query MLflow) to confirm or
+override this choice before moving to hyperparameter tuning.
 """),
     ]
 
@@ -1533,13 +1630,20 @@ CV_FOLDS  = {cv_folds}
 cv_split  = {cv_cls}(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
 
 # ── Helper: wrap a builder function into an Optuna objective ──────
-def make_objective(build_fn):
+def make_objective(build_fn, parent_run_id=None):
     def objective(trial):
         model  = build_fn(trial)
         scores = cross_val_score(model, X_train, y_train,
                                  cv=cv_split, scoring=SCORING, n_jobs=-1,
                                  error_score="raise")
-        return float(scores.mean())
+        cv_mean = float(scores.mean())
+        if ENABLE_HPO_MLFLOW and parent_run_id:
+            with mlflow.start_run(run_name=f"trial_{{trial.number}}", nested=True,
+                                  parent_run_id=parent_run_id):
+                mlflow.log_params(trial.params)
+                mlflow.log_metric(SCORING, cv_mean)
+                mlflow.log_metric("cv_std", float(scores.std()))
+        return cv_mean
     return objective
 
 # ── All model builder functions + candidate list ──────────────────
@@ -1553,22 +1657,56 @@ if HAS_OPTUNA:
     for model_name, build_fn in MODEL_CANDIDATES:
         print(f"  Tuning {{model_name:<28}} ({{N_TRIALS}} trials) ...", end=" ", flush=True)
         try:
+            _parent_run_id = None
+            _parent_ctx    = None
+
+            if ENABLE_HPO_MLFLOW:
+                _parent_ctx = mlflow.start_run(run_name=f"hpo_{{model_name}}")
+                _parent_run = _parent_ctx.__enter__()
+                _parent_run_id = _parent_run.info.run_id
+                mlflow.log_param("model_name", model_name)
+                mlflow.log_param("n_trials",   N_TRIALS)
+                mlflow.log_param("cv_folds",   CV_FOLDS)
+                mlflow.log_param("scoring",    SCORING)
+
             study = optuna.create_study(
                 study_name=model_name,
                 direction="maximize",
                 sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE),
             )
-            study.optimize(make_objective(build_fn), n_trials=N_TRIALS,
-                           show_progress_bar=False)
+            study.optimize(make_objective(build_fn, parent_run_id=_parent_run_id),
+                           n_trials=N_TRIALS, show_progress_bar=False)
+
+            best_score = round(study.best_value, 4)
             tuning_results.append({{
                 "model":       model_name,
-                "best_score":  round(study.best_value, 4),
+                "best_score":  best_score,
                 "n_trials":    len(study.trials),
                 "best_params": study.best_params,
+                "run_id":      _parent_run_id or "",
             }})
-            print(f"{{SCORING}} = {{study.best_value:.4f}}")
+
+            if ENABLE_HPO_MLFLOW and _parent_ctx is not None:
+                mlflow.log_metric(f"best_{{SCORING}}", best_score)
+                mlflow.log_params({{f"best_{{k}}": v for k, v in study.best_params.items()}})
+                # Rebuild and log best model artifact
+                try:
+                    _best_model = build_fn(study.best_trial)
+                    _best_model.fit(X_train, y_train)
+                    mlflow.sklearn.log_model(_best_model, artifact_path="best_model")
+                except Exception:
+                    pass
+                _parent_ctx.__exit__(None, None, None)
+
+            print(f"{{SCORING}} = {{study.best_value:.4f}}"
+                  + (f"  run={{_parent_run_id[:8]}}" if _parent_run_id else ""))
         except Exception as exc:
             print(f"FAILED — {{exc}}")
+            try:
+                if ENABLE_HPO_MLFLOW and _parent_ctx is not None:
+                    _parent_ctx.__exit__(type(exc), exc, exc.__traceback__)
+            except Exception:
+                pass
 
     print(f"\\nTuning complete. {{len(tuning_results)}} models evaluated.")
 else:
@@ -1579,7 +1717,7 @@ else:
 # ── Compare all models ────────────────────────────────────────────
 if tuning_results:
     tuning_df = pd.DataFrame(tuning_results).sort_values("best_score", ascending=False).reset_index(drop=True)
-    display(tuning_df[["model", "best_score", "n_trials"]])
+    display(tuning_df[["model", "best_score", "n_trials", "run_id"]])
 
     fig, ax = plt.subplots(figsize=(12, max(5, len(tuning_df) * 0.5)))
     colors = ["#22c55e" if i == 0 else "#6366f1" for i in range(len(tuning_df))]
@@ -1595,8 +1733,25 @@ if tuning_results:
     print(f"Best {{SCORING}}: {{tuning_df.iloc[0]['best_score']:.4f}}")
     print(f"Best params: {{BEST_PARAMS}}")
 else:
-    BEST_PARAMS = {}
     print("No tuning results — install optuna: pip install optuna")
+
+# ── Pull best HPO run from MLflow (if logged) ─────────────────────
+if ENABLE_HPO_MLFLOW:
+    _client = mlflow.tracking.MlflowClient()
+    _exp    = mlflow.get_experiment_by_name(MLFLOW_EXPERIMENT)
+    if _exp:
+        _hpo_runs = _client.search_runs(
+            experiment_ids=[_exp.experiment_id],
+            filter_string="tags.`mlflow.runName` LIKE 'hpo_%'",
+            order_by=[f"metrics.best_{{SCORING}} DESC"],
+            max_results=1,
+        )
+        if _hpo_runs:
+            _best_hpo = _hpo_runs[0]
+            print(f"\\nMLflow best HPO run   : {{_best_hpo.data.tags.get('mlflow.runName', '?')}}")
+            print(f"  best_{{SCORING:<8}}  : {{_best_hpo.data.metrics.get(f'best_{{SCORING}}', '?')}}")
+            print(f"  run_id         : {{_best_hpo.info.run_id}}")
+            print(f"  To inspect     : mlflow ui --backend-store-uri {{MLFLOW_TRACKING_URI}}")
 """),
         _md(f"""\
 ## Best Model Decision

@@ -418,12 +418,18 @@ def _mutual_information(df: pd.DataFrame, feature_cols: list,
     for col in feature_cols:
         s = df[col].copy()
         is_cat = s.dtype == object or str(s.dtype) == "category"
+        is_datetime = pd.api.types.is_datetime64_any_dtype(s)
         if is_cat:
             enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
             s = enc.fit_transform(s.values.reshape(-1, 1)).ravel()
             discrete_mask.append(True)
+        elif is_datetime:
+            s = s.astype("int64").astype(float)
+            s[s == float(pd.NaT.value)] = np.nan
+            s = np.where(np.isnan(s), np.nanmedian(s), s)
+            discrete_mask.append(False)
         else:
-            s = s.fillna(s.median()).values
+            s = s.fillna(s.median()).values.astype(float)
             discrete_mask.append(False)
         X_parts.append(s)
         col_order.append(col)
